@@ -42,6 +42,12 @@ jobs:
           clang -O2 -D_GNU_SOURCE -march=x86-64-v3 -Ihost -I/tmp/hookshot_rt64 -I/tmp/hookshot_gen -Wno-everything \
             tests/setjmp_test.c -o "$RUNNER_TEMP/sjt"
           "$RUNNER_TEMP/sjt"
+      - name: Insert menu text (run)
+        run: |
+          clang -c -O1 -D_GNU_SOURCE -Ihost host/plat_posix.c -o "$RUNNER_TEMP/plat.o"
+          clang++ -std=c++20 -O1 -D_GNU_SOURCE -Ihost -Igpu/vk tests/gdi_lite_test.cpp "$RUNNER_TEMP/plat.o" \
+            -o "$RUNNER_TEMP/gdit" -lpthread -ldl
+          "$RUNNER_TEMP/gdit"
       - name: Vulkan back end (compile)
         run: python3 -I scripts/linux_check.py --vk --jobs 4
       - name: Builder tests

@@ -8,7 +8,10 @@
 #include <cstring>
 
 namespace gdi_lite {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc++11-narrowing"   // (a C table of char: 0x80-0xFF in C++)
 #include "../../third_party/font8x8/font8x8_basic.h"
+#pragma clang diagnostic pop
 }
 
 typedef uint32_t COLORREF;
@@ -20,9 +23,13 @@ struct GdiObj {
     int px = 0, weight = 0;
     COLORREF colour = 0;
 };
+/// a new DC's own bitmap and font, as GDI's stock objects: what SelectObject hands back first, so the caller's
+/// "select the old one back" before deleting its own always has something to select
+inline GdiObj* gdi_stock_bitmap() { static GdiObj o{GdiObj::BITMAP}; return &o; }   // (0 x 0: draws nothing)
+inline GdiObj* gdi_stock_font() { static GdiObj o{GdiObj::FONT, 0, 0, nullptr, 16, 400}; return &o; }
 struct GdiDc {
-    GdiObj* bitmap = nullptr;
-    GdiObj* font = nullptr;
+    GdiObj* bitmap = gdi_stock_bitmap();
+    GdiObj* font = gdi_stock_font();
     COLORREF text = 0;
     unsigned align = 0;
 };
@@ -52,12 +59,13 @@ inline HFONT CreateFontA(int height, int, int, int, int weight, DWORD, DWORD, DW
 }
 inline HBRUSH CreateSolidBrush(COLORREF c) { auto* o = new GdiObj{GdiObj::BRUSH}; o->colour = c; return o; }
 inline BOOL DeleteObject(HGDIOBJ o) {
-    if (!o) return FALSE;
+    if (!o || o == gdi_stock_bitmap() || o == gdi_stock_font()) return FALSE;
     free(o->bits);
     delete o;
     return TRUE;
 }
 inline HGDIOBJ SelectObject(HDC dc, HGDIOBJ o) {
+    if (!dc || !o) return nullptr;
     GdiObj*& slot = o->kind == GdiObj::BITMAP ? dc->bitmap : dc->font;
     GdiObj* was = slot;
     slot = o;
