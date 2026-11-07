@@ -183,6 +183,10 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
 static void dec_init(Ctx *c, enum AVCodecID id, const char *what) { dec_init_sized(c, id, what, 0, 0); }
 static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, int h) {
     const AVCodec *codec = avcodec_find_decoder(id);
+#ifndef _WIN32
+    /* (linux port) the system's FFmpeg: libdav1d for AV1 (FFmpeg's own AV1 decoder needs a hardware context) */
+    if (id == AV_CODEC_ID_AV1 && avcodec_find_decoder_by_name("libdav1d")) codec = avcodec_find_decoder_by_name("libdav1d");
+#endif
     Dec *d = (Dec *)calloc(1, sizeof *d);
     InitializeSRWLock(&d->lock);
     if (codec) {

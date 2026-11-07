@@ -41,7 +41,10 @@ def native_target():
 def native_link():
     # (-fuse-ld=lld, found through -B: clang ignores --ld-path for the MSVC target and ran Microsoft's link.exe, which
     # cannot read the renderer's ThinLTO bitcode)
-    return ["-fuse-ld=lld", "-B" + os.path.dirname(lld_link())] if os.name == "nt" else []
+    if os.name == "nt":
+        return ["-fuse-ld=lld", "-B" + os.path.dirname(lld_link())]
+    # (linux port) lld when it is there: its symbol ordering file is how the hot functions are packed together
+    return ["-fuse-ld=lld"] if shutil.which("ld.lld") or os.path.isfile(find("ld.lld")) else []
 
 
 def default_jobs(gb_per_job=3.5):

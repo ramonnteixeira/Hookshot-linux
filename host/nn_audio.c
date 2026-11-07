@@ -19,7 +19,11 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include "win32_compat.h"
+#ifdef _WIN32
 #include <mmsystem.h>
+#else
+#include "sdl_dyn.h"   /* (linux port: the sound goes out through SDL2) */
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -565,10 +569,17 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
 
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
+#ifdef _WIN32
 static HWAVEOUT wout;
 static WAVEHDR hdr[NBLOCKS];
 static int16_t blocks[NBLOCKS][FRAME * 2 * 2];
 static int fill_block, fill_frames;
+#else
+/* (linux port) an SDL2 audio device in queue mode: as many 10 ms blocks may wait in it as waveOut had headers, and a
+   frame that would go past that is dropped (the device is behind), as on Windows */
+static const SdlDyn *sdl_out;
+static uint32_t sdl_dev;
+#endif
 static FILE *dump;
 static uint32_t dump_bytes;
 
@@ -579,6 +590,23 @@ static void output_open(void) {
         fwrite(z, 1, 44, dump);
     }
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
+#ifndef _WIN32
+    const SdlDyn *s = hos_sdl();
+    if (!s || s->InitSubSystem(SDLD_INIT_AUDIO)) {
+        hos_log("audio: no output device%s%s", s ? ": " : "", s ? s->GetError() : "");
+        return;
+    }
+    SdlAudioSpec want = {0}, have;
+    want.freq = RATE, want.format = SDLD_AUDIO_S16LSB, want.channels = 2, want.samples = FRAME * 2;
+    sdl_dev = s->OpenAudioDevice(NULL, 0, &want, &have, 0);   /* (no changes allowed: SDL converts to the device) */
+    if (!sdl_dev) {
+        hos_log("audio: no output device: %s", s->GetError());
+        return;
+    }
+    s->PauseAudioDevice(sdl_dev, 0);
+    sdl_out = s;
+    return;
+#else
     WAVEFORMATEX f = {0};
     f.wFormatTag = WAVE_FORMAT_PCM;
     f.nChannels = 2;
@@ -596,6 +624,7 @@ static void output_open(void) {
         hdr[i].dwBufferLength = sizeof blocks[i];
         hdr[i].dwFlags = WHDR_DONE;
     }
+#endif
 }
 static void dump_finish(void) {
     if (!dump) return;
@@ -629,6 +658,11 @@ static void output_frame(const int16_t *pcm) {
             fseek(dump, at, SEEK_SET);
         }
     }
+#ifndef _WIN32
+    if (!sdl_out) return;
+    if (sdl_out->GetQueuedAudioSize(sdl_dev) >= NBLOCKS * 2 * FRAME * 4) return;   /* the device is behind: dropped */
+    sdl_out->QueueAudio(sdl_dev, pcm, FRAME * 4);
+#else
     if (!wout) return;
     WAVEHDR *h = &hdr[fill_block];
     if (fill_frames == 0) {
@@ -643,6 +677,7 @@ static void output_frame(const int16_t *pcm) {
         fill_frames = 0;
         fill_block = (fill_block + 1) % NBLOCKS;
     }
+#endif
 }
 
 /* ---- parameter updates ------------------------------------------------------------------------------------------

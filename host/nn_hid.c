@@ -23,7 +23,9 @@
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include "win32_compat.h"
+#ifdef _WIN32
 #include <xinput.h>
+#endif
 
 enum { B_A = 0, B_B, B_X, B_Y, B_LS, B_RS, B_L, B_R, B_ZL, B_ZR, B_PLUS, B_MINUS, B_LEFT, B_UP, B_RIGHT, B_DOWN };
 #define STATE_SIZE 0x28
@@ -161,6 +163,19 @@ static int mouse_stick(int32_t *rx, int32_t *ry, int pointing) {
     return 1;
 }
 
+#ifndef _WIN32
+/* (linux port) the game's input counts while its window has the focus (display_sdl.c) */
+int hos_window_focused(void);
+static int game_in_front(void) {
+    static int was_front = 1;
+    const int front = hos_window_focused();
+    if (front != was_front) {
+        hos_log("hid: input %s", front ? "back" : "paused: the game window is not in front");
+        was_front = front;
+    }
+    return front;
+}
+#else
 static int game_in_front(void) {
     DWORD pid = 0;
     HWND w = GetForegroundWindow();
@@ -186,6 +201,7 @@ static int game_in_front(void) {
 #endif
     return front;
 }
+#endif
 
 /* HOS_INPUT_SCRIPT, and HOS_INPUT_LIVE=<file>: lines appended to that file while the game runs are presses in the
    script's syntax, their times counted from when the line is read ("0:LUP/2000,2:A"): a test can steer the game

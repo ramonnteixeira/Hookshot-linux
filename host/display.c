@@ -7,6 +7,7 @@
    HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11: fullscreen.
    Mouse: a click in the window captures the mouse (hidden, kept in the window), Esc or leaving the window releases
    it (nn_hid.c reads its motion). */
+#ifdef _WIN32   /* (linux port: display_sdl.c) */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,3 +229,4 @@ void hos_display_start(void) {
     renderer_up = CreateEventA(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, display_main, NULL, 0, NULL);
 }
+#endif /* _WIN32 */

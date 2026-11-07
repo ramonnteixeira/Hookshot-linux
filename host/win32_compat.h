@@ -33,6 +33,10 @@
 #include <wchar.h>
 #include <pthread.h>
 #include <immintrin.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strings.h>
+#include <time.h>
 
 /* ---- types (LONG is 32 bits, as on Windows: `long` is 64 on Linux) */
 typedef int BOOL;
@@ -85,10 +89,18 @@ typedef struct { LONG x, y; } POINT;
 #define ERROR_ALREADY_EXISTS 183u
 #define ERROR_TIMEOUT 1460u
 #define ERROR_NOT_ALL_ASSIGNED 1300u
+/* the MSVC C library's names */
 #define _strdup strdup
 #define _stricmp strcasecmp
 #define _strnicmp strncasecmp
 #define __int64 long long
+#define _atoi64 atoll
+#define _ftelli64 ftello
+#define _fseeki64 fseeko
+#define _mkgmtime timegm
+#define _putenv putenv
+static inline int localtime_s(struct tm *out, const time_t *t) { return localtime_r(t, out) ? 0 : 22; }   /* (EINVAL) */
+static inline int gmtime_s(struct tm *out, const time_t *t) { return gmtime_r(t, out) ? 0 : 22; }
 
 DWORD GetLastError(void);
 void SetLastError(DWORD e);
@@ -108,7 +120,7 @@ void SetLastError(DWORD e);
 #define InterlockedExchangePointer InterlockedExchange
 #define InterlockedOr(p, v) __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
 #define InterlockedAnd(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
-#define InterlockedCompareExchange(p, x, cmp) __extension__({ __typeof__(*(p)) w32_c_ = (cmp); \
+#define InterlockedCompareExchange(p, x, cmp) __extension__({ __auto_type w32_c_ = (__typeof__(*(p)))(cmp); \
     __atomic_compare_exchange_n((p), &w32_c_, (x), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); w32_c_; })
 #define InterlockedCompareExchange64 InterlockedCompareExchange
 #define InterlockedCompareExchangePointer InterlockedCompareExchange
@@ -340,6 +352,37 @@ void OutputDebugStringA(LPCSTR s);
 #define SM_CYSCREEN 1
 int GetSystemMetrics(int which);   /* the screen's size once the window system is up (display_sdl.c), 0 before */
 extern int w32_screen_w, w32_screen_h;
+
+/* ---- the window (display_sdl.c: the SDL window, its keyboard and mouse) */
+typedef int16_t SHORT;
+typedef uintptr_t WPARAM;
+typedef intptr_t LPARAM;
+#define WM_APP 0x8000u
+SHORT GetAsyncKeyState(int vk);
+HWND GetForegroundWindow(void);
+DWORD GetWindowThreadProcessId(HWND w, DWORD *pid);
+BOOL GetClientRect(HWND w, RECT *r);
+BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp);   /* (WM_APP + 7 only: the menu's fullscreen request) */
+enum {
+    VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D,
+    VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_PRIOR = 0x21,
+    VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28,
+    VK_INSERT = 0x2D, VK_DELETE = 0x2E, VK_ADD = 0x6B, VK_SUBTRACT = 0x6D, VK_F1 = 0x70, VK_F2, VK_F3, VK_F4, VK_F5,
+    VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_LSHIFT = 0xA0, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL,
+    VK_LMENU, VK_RMENU, VK_OEM_PLUS = 0xBB, VK_OEM_MINUS = 0xBD,
+};
+
+/* ---- XInput's types (no XInput here: nn_hid.c finds no DLL, and SDL's pads come through pad_sdl.c) */
+typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; } XINPUT_GAMEPAD;
+typedef struct { DWORD dwPacketNumber; XINPUT_GAMEPAD Gamepad; } XINPUT_STATE;
+#define XUSER_MAX_COUNT 4
+enum {
+    XINPUT_GAMEPAD_DPAD_UP = 0x0001, XINPUT_GAMEPAD_DPAD_DOWN = 0x0002, XINPUT_GAMEPAD_DPAD_LEFT = 0x0004,
+    XINPUT_GAMEPAD_DPAD_RIGHT = 0x0008, XINPUT_GAMEPAD_START = 0x0010, XINPUT_GAMEPAD_BACK = 0x0020,
+    XINPUT_GAMEPAD_LEFT_THUMB = 0x0040, XINPUT_GAMEPAD_RIGHT_THUMB = 0x0080, XINPUT_GAMEPAD_LEFT_SHOULDER = 0x0100,
+    XINPUT_GAMEPAD_RIGHT_SHOULDER = 0x0200, XINPUT_GAMEPAD_A = 0x1000, XINPUT_GAMEPAD_B = 0x2000,
+    XINPUT_GAMEPAD_X = 0x4000, XINPUT_GAMEPAD_Y = 0x8000,
+};
 #define OutputDebugString OutputDebugStringA
 
 #endif /* !_WIN32 */
