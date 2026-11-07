@@ -9,7 +9,15 @@
 // A program's stages are emitted with one Backend::Bindings, so their descriptors share one set in Eden's order
 // (per stage: uniform buffers, storage buffers, texture buffers, image buffers, textures, images), which
 // vk_pipeline.cpp lays out from the stages' Info the same way.
+#ifdef _WIN32
 #include <io.h>
+#else
+#include <unistd.h>   // (linux port: _chsize_s, _fileno)
+#define _fileno fileno
+#define _chsize_s(fd, size) ftruncate((fd), (off_t)(size))
+extern char** environ;
+#define _environ environ
+#endif
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>

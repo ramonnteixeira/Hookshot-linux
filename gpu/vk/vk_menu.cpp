@@ -10,6 +10,9 @@
 #include <vector>
 
 #include "vk_menu.h"
+#ifndef _WIN32
+#include "gdi_lite.h"   // (linux port: GDI's text and rectangles, drawn here)
+#endif
 
 namespace mkwvk {
 HWND app_window();

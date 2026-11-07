@@ -12,7 +12,7 @@
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"   // (linux port: <windows.h> on Windows)
 
 #include "vk_internal.h"
 #include "vk_state.h"

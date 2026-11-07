@@ -42,6 +42,8 @@ static void WINAPI fiber_fn(LPVOID p) {
     SwitchToFiber(main_fiber);
 }
 
+static void bad_read(void *p) { *(volatile int *)p = *(volatile int *)0x10; }
+static void good_call(void *p) { *(int *)p = 1; }
 static volatile char *guarded;
 static LONG CALLBACK on_fault(EXCEPTION_POINTERS *e) {
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
@@ -159,6 +161,12 @@ int main(void) {
     CHECK(mem[100] == 0);
     CHECK(VirtualFree(mem, 0, MEM_RELEASE));
     CHECK(VirtualQuery(mem, &mbi, sizeof mbi) && mbi.State == MEM_FREE);
+
+    /* __try / __except: a fault abandons the call, a clean one returns */
+    int out = 0;
+    CHECK(w32_guard(bad_read, &out) == 0);
+    CHECK(w32_guard(good_call, &out) == 1 && out == 1);
+    CHECK(w32_guard(bad_read, &out) == 0);   /* (again: the signal is not left blocked) */
 
     /* modules */
     char exe[MAX_PATH];

@@ -423,6 +423,7 @@ bool depth_aspect(VkFormat f) {
 }
 
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
+#ifdef _WIN32
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
@@ -437,6 +438,23 @@ __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkCom
         return (VkResult)-77;   // (a fault in the driver, told apart from what it returns)
     }
 }
+#else
+// (linux port) the same, with w32_guard (host/plat_posix.c: a fault in the call is caught by its signal handler)
+struct GuardedGraphics { VkPipelineCache cache; const VkGraphicsPipelineCreateInfo* ci; VkPipeline* pl; VkResult r; };
+struct GuardedCompute { VkPipelineCache cache; const VkComputePipelineCreateInfo* ci; VkPipeline* pl; VkResult r; };
+__attribute__((noinline)) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+    GuardedGraphics g{cache, ci, pl, VK_ERROR_UNKNOWN};
+    if (!w32_guard([](void* p) { auto* g = (GuardedGraphics*)p; g->r = vkCreateGraphicsPipelines(dev.device, g->cache, 1, g->ci, nullptr, g->pl); }, &g))
+        return VK_ERROR_UNKNOWN;
+    return g.r;
+}
+__attribute__((noinline)) VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    GuardedCompute g{cache, ci, pl, VK_ERROR_UNKNOWN};
+    if (!w32_guard([](void* p) { auto* g = (GuardedCompute*)p; g->r = vkCreateComputePipelines(dev.device, g->cache, 1, g->ci, nullptr, g->pl); }, &g))
+        return (VkResult)-77;   // (a fault in the driver, told apart from what it returns)
+    return g.r;
+}
+#endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
@@ -1337,7 +1355,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     static const bool stretch = getenv("RX_VK_SSBO_STRETCH") != nullptr;
                     if (stretch && !d.is_written && addr && d.count == 1)
                         if (const uint64_t end = gpu_pool_end(base); end > base + n)
-                            n = std::max(n, std::min<uint64_t>(end - base, 64ull << 20) & ~3ull);
+                            n = std::max<uint64_t>(n, std::min<uint64_t>(end - base, 64ull << 20) & ~3ull);
                 }
                 const auto t0 = std::chrono::steady_clock::now();
                 // (hookshot) a storage buffer table's entries (count > 1, Info::global_tables): the ones past the table's

@@ -102,8 +102,13 @@ typedef struct MkwVkRenderer {
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */
 typedef const MkwVkRenderer *(*mkwvk_init_fn)(const MkwVkHost *host);
+#ifdef _WIN32
+#define MKWVK_EXPORT __declspec(dllexport)
+#else
+#define MKWVK_EXPORT __attribute__((visibility("default")))
+#endif
 #ifdef MKWVK_BUILDING
-__declspec(dllexport) const MkwVkRenderer *mkwvk_init(const MkwVkHost *host);
+MKWVK_EXPORT const MkwVkRenderer *mkwvk_init(const MkwVkHost *host);
 #endif
 
 #ifdef __cplusplus

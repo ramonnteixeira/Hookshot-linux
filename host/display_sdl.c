@@ -174,6 +174,9 @@ BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_APP + 7) InterlockedExchange(&want_fullscreen, wp ? 1 : 0);   /* (the Insert menu's Fullscreen row) */
     return TRUE;
 }
+LONG GetWindowLongA(HWND w, int index) {
+    return index == GWL_STYLE && w && w == window && !fullscreen ? (LONG)WS_CAPTION : 0;
+}
 /* Windows virtual-key codes as SDL scancodes */
 static int scancode(int vk) {
     if (vk >= 'A' && vk <= 'Z') return 4 + (vk - 'A');

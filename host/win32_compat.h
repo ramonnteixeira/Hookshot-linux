@@ -38,6 +38,10 @@
 #include <strings.h>
 #include <time.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- types (LONG is 32 bits, as on Windows: `long` is 64 on Linux) */
 typedef int BOOL;
 typedef uint8_t BYTE;
@@ -120,7 +124,12 @@ void SetLastError(DWORD e);
 #define InterlockedExchangePointer InterlockedExchange
 #define InterlockedOr(p, v) __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
 #define InterlockedAnd(p, v) __atomic_fetch_and((p), (v), __ATOMIC_SEQ_CST)
-#define InterlockedCompareExchange(p, x, cmp) __extension__({ __auto_type w32_c_ = (__typeof__(*(p)))(cmp); \
+#ifdef __cplusplus
+#define W32_AUTO auto
+#else
+#define W32_AUTO __auto_type
+#endif
+#define InterlockedCompareExchange(p, x, cmp) __extension__({ W32_AUTO w32_c_ = (__typeof__(*(p)))(cmp); \
     __atomic_compare_exchange_n((p), &w32_c_, (x), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); w32_c_; })
 #define InterlockedCompareExchange64 InterlockedCompareExchange
 #define InterlockedCompareExchangePointer InterlockedCompareExchange
@@ -302,6 +311,8 @@ BOOL FreeLibrary(HMODULE m);
 #define PAGE_NOACCESS 0x01u
 #define PAGE_READONLY 0x02u
 #define PAGE_READWRITE 0x04u
+#define PAGE_WRITECOPY 0x08u
+#define PAGE_GUARD 0x100u
 #define PAGE_EXECUTE 0x10u
 #define PAGE_EXECUTE_READ 0x20u
 #define PAGE_EXECUTE_READWRITE 0x40u
@@ -363,6 +374,9 @@ HWND GetForegroundWindow(void);
 DWORD GetWindowThreadProcessId(HWND w, DWORD *pid);
 BOOL GetClientRect(HWND w, RECT *r);
 BOOL PostMessageA(HWND w, UINT msg, WPARAM wp, LPARAM lp);   /* (WM_APP + 7 only: the menu's fullscreen request) */
+#define GWL_STYLE (-16)
+#define WS_CAPTION 0x00C00000L
+LONG GetWindowLongA(HWND w, int index);   /* (GWL_STYLE: WS_CAPTION unless the window is fullscreen) */
 enum {
     VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_MBUTTON = 0x04, VK_BACK = 0x08, VK_TAB = 0x09, VK_RETURN = 0x0D,
     VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_PRIOR = 0x21,
@@ -385,5 +399,13 @@ enum {
 };
 #define OutputDebugString OutputDebugStringA
 
+/* ---- __try / __except: runs fn(arg); 1 when it returned, 0 when it faulted (SIGSEGV, SIGBUS, SIGILL, SIGFPE) and
+   was abandoned there. For calls into code that may fault (a driver's shader compiler, a copy from a page unmapped
+   meanwhile); the vectored handlers see the fault first, as on Windows. */
+int w32_guard(void (*fn)(void *), void *arg);
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* !_WIN32 */
 #endif

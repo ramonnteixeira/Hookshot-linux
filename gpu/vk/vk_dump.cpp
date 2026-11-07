@@ -8,7 +8,12 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
 #include <direct.h>
+#else
+#include <sys/stat.h>   // (linux port)
+#define _mkdir(d) mkdir((d), 0755)
+#endif
 
 #include "vk_dump.h"
 

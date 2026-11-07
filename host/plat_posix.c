@@ -891,6 +891,21 @@ static void store_context(const CONTEXT *c, ucontext_t *uc) {
     g[REG_R12] = c->R12, g[REG_R13] = c->R13, g[REG_R14] = c->R14, g[REG_R15] = c->R15;
     g[REG_RIP] = c->Rip, g[REG_EFL] = c->EFlags;
 }
+#include <setjmp.h>
+static __thread sigjmp_buf *guard_jb;   /* (w32_guard's, while its call runs) */
+static void install_signals(void);
+int w32_guard(void (*fn)(void *), void *arg) {
+    install_signals();
+    sigjmp_buf jb, *outer = guard_jb;
+    if (sigsetjmp(jb, 1)) {
+        guard_jb = outer;
+        return 0;
+    }
+    guard_jb = &jb;
+    fn(arg);
+    guard_jb = outer;
+    return 1;
+}
 static void on_signal(int sig, siginfo_t *si, void *ucv) {
     ucontext_t *uc = (ucontext_t *)ucv;
     EXCEPTION_RECORD rec;
@@ -916,6 +931,7 @@ static void on_signal(int sig, siginfo_t *si, void *ucv) {
         PVECTORED_EXCEPTION_HANDLER h = veh[i];
         if (h && h(&ep) == EXCEPTION_CONTINUE_EXECUTION) { store_context(&ctx, uc); return; }
     }
+    if (guard_jb && sig != SIGTRAP) siglongjmp(*guard_jb, 1);   /* (a w32_guard call: its __except) */
     if (top_filter && top_filter(&ep) == EXCEPTION_CONTINUE_EXECUTION) { store_context(&ctx, uc); return; }
     /* (unhandled: whatever was there before, or the default action, which ends the process with this signal) */
     struct sigaction *o = &old_act[sig];

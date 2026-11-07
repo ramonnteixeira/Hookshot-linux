@@ -1584,7 +1584,7 @@ std::unique_ptr<std::atomic<uint16_t>[]> tex_pages[(1ull << 39 >> 12) / kTexPage
 std::mutex tex_pages_mu;
 void tex_pages_add(const nvn_tex* t, int d) {
     if (!t || !t->gpu || t->gpu >= (1ull << 39) || !t->L.size) return;   // (the guest window: virtual pools are not read)
-    const uint64_t p0 = t->gpu >> 12, p1 = std::min((t->gpu + t->L.size - 1) >> 12, (1ull << 39 >> 12) - 1);
+    const uint64_t p0 = t->gpu >> 12, p1 = std::min<uint64_t>((t->gpu + t->L.size - 1) >> 12, (1ull << 39 >> 12) - 1);
     for (uint64_t p = p0; p <= p1; p++) {
         auto& c = tex_pages[p / kTexPageChunk];
         if (!c) {
@@ -1602,7 +1602,7 @@ void tex_pages_add(const nvn_tex* t, int d) {
 }
 bool tex_pages_any(uint64_t gpu, uint64_t size) {
     if (gpu >= (1ull << 39)) return true;   // (not tracked: as before)
-    const uint64_t p0 = gpu >> 12, p1 = std::min((gpu + size - 1) >> 12, (1ull << 39 >> 12) - 1);
+    const uint64_t p0 = gpu >> 12, p1 = std::min<uint64_t>((gpu + size - 1) >> 12, (1ull << 39 >> 12) - 1);
     for (uint64_t p = p0; p <= p1; p++) {
         const auto& c = tex_pages[p / kTexPageChunk];
         if (!c) { p = (p / kTexPageChunk + 1) * kTexPageChunk - 1; continue; }
