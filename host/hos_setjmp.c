@@ -36,10 +36,22 @@ typedef struct { uint64_t rets[4], target; void *buf[32]; } SjSlot;   /* (buf: r
 typedef struct { SjSlot slot[DEPTH]; int depth, overflow; } SjStack;
 static _Thread_local SjStack *stack;
 
+/* (linux port) The bodies address the buffer through rcx and take longjmp's value in edx, Win64's first two
+   arguments. The System V ABI passes them in rdi and esi: there each function first copies them there (rdi and esi
+   are saved and restored as data after that, from the buffer). */
+#ifdef _WIN32
+#define SJ_SETJMP_ARGS ""
+#define SJ_LONGJMP_ARGS ""
+#else
+#define SJ_SETJMP_ARGS "movq %rdi, %rcx\n\t"
+#define SJ_LONGJMP_ARGS "movq %rdi, %rcx\n\tmovl %esi, %edx\n\t"
+#endif
+
 /* buf: rbx rbp rdi rsi r12 r13 r14 r15 at 0-56, rsp (after the return) at 64, the return address at 72, xmm6-15 at
    80-224, mxcsr at 240 and the x87 control word at 244 */
 __attribute__((naked, returns_twice)) int recomp_sj_setjmp(void **buf) {
     __asm__ volatile(
+        SJ_SETJMP_ARGS
         "movq %rbx, 0(%rcx)\n\t"
         "movq %rbp, 8(%rcx)\n\t"
         "movq %rdi, 16(%rcx)\n\t"
@@ -70,6 +82,7 @@ __attribute__((naked, returns_twice)) int recomp_sj_setjmp(void **buf) {
 
 __attribute__((naked, noreturn)) static void recomp_sj_longjmp(void **buf, int value) {
     __asm__ volatile(
+        SJ_LONGJMP_ARGS
         "movq 0(%rcx), %rbx\n\t"
         "movq 8(%rcx), %rbp\n\t"
         "movq 16(%rcx), %rdi\n\t"

@@ -37,6 +37,11 @@ jobs:
           "$RUNNER_TEMP/w32t"
       - name: Host runtime (compile)
         run: python3 -I scripts/linux_check.py
+      - name: setjmp / longjmp (run)
+        run: |
+          clang -O2 -D_GNU_SOURCE -march=x86-64-v3 -Ihost -I/tmp/hookshot_rt64 -I/tmp/hookshot_gen -Wno-everything \
+            tests/setjmp_test.c -o "$RUNNER_TEMP/sjt"
+          "$RUNNER_TEMP/sjt"
       - name: Vulkan back end (compile)
         run: python3 -I scripts/linux_check.py --vk --jobs 4
       - name: Builder tests
