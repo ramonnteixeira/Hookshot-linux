@@ -23,7 +23,7 @@
 #endif
 #define HOS_IS_SEP(ch) ((ch) == '\\' || (ch) == '/')
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)   /* (the web build has a windows.h of its own) */
 #include <windows.h>
 #else
 
@@ -407,5 +407,5 @@ int w32_guard(void (*fn)(void *), void *arg);
 #ifdef __cplusplus
 }
 #endif
-#endif /* !_WIN32 */
+#endif /* !_WIN32 && !__EMSCRIPTEN__ */
 #endif

@@ -7,7 +7,7 @@
 
    It also stands in for the few window calls the rest of the host and the renderer make (GetAsyncKeyState,
    GetForegroundWindow, GetClientRect, PostMessageA), answered from SDL's state. */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>

@@ -1,5 +1,5 @@
 /* (linux port) host/win32_compat.h on POSIX: the Win32 subset the host layer uses. Not built on Windows. */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

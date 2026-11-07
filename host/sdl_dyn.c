@@ -1,6 +1,6 @@
 /* (linux port) host/sdl_dyn.h: the system's SDL2, opened at run time. Linux only (Windows has its own window, sound
    and XInput, and pad_sdl.c's SDL2.dll for pads). */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 #include "hos.h"
 #include "sdl_dyn.h"
 #include <dlfcn.h>
