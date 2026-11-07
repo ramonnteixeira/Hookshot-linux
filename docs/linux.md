@@ -11,7 +11,7 @@ Vulkan in `gpu/vk/`. Only the layer that talks to the operating system changes.
 
 - 64-bit Linux on x86-64 with a CPU from 2013 or later (x86-64-v3: Haswell, Zen 1).
 - A GPU and driver with Vulkan 1.3 and mesh shaders (NVIDIA's driver, or Mesa's RADV/ANV recent enough).
-- To build: Python 3 with `lz4`, `numpy`, `capstone` and `unicorn`; clang 17 or later and lld; the development files of
+- To build: Python 3 with `lz4`, `numpy`, `capstone`, `unicorn`, `zstandard` and Pillow; clang 17 or later and lld; the development files of
   FFmpeg (`libavcodec`, `libswscale`, `libswresample`, `libavutil`, through `pkg-config`), Vulkan, SPIR-V and the
   Vulkan Memory Allocator.
 - To run: SDL2 (window, sound, controllers), the Vulkan loader, and FFmpeg built with libdav1d for the AV1 movies.
@@ -19,11 +19,16 @@ Vulkan in `gpu/vk/`. Only the layer that talks to the operating system changes.
 On Debian or Ubuntu 24.04:
 
 ```
-sudo apt install clang lld pkg-config python3-numpy python3-pip \
+sudo apt install clang lld pkg-config \
+    python3-lz4 python3-numpy python3-capstone python3-unicorn python3-zstandard python3-pil \
     libavcodec-dev libswscale-dev libswresample-dev libavutil-dev \
     libvulkan-dev spirv-headers libsdl2-2.0-0 libdav1d7
-pip install lz4 capstone unicorn
 ```
+
+(Where the distribution has no `python3-unicorn`, `pip install --user --break-system-packages unicorn`.)
+
+If `/tmp` is a small RAM disk (`df -h /tmp`), point the compiler's temporary files at the disk before building:
+`mkdir -p ~/tmp && export TMPDIR=~/tmp`.
 
 If your distribution has no package for the Vulkan Memory Allocator, clone it and point the build at it:
 `git clone https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator` and `export RX_VMA=<that folder>`.
