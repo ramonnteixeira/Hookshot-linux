@@ -6,11 +6,12 @@
 #include <string.h>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 static SRWLOCK lock = SRWLOCK_INIT;
 #define LOCK() AcquireSRWLockExclusive(&lock)
 #define UNLOCK() ReleaseSRWLockExclusive(&lock)
 #else
+#include "win32_compat.h"   /* (linux port: VirtualFree's decommit is madvise) */
 #include <pthread.h>
 #include <sys/mman.h>
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;

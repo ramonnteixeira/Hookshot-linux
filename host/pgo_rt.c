@@ -3,11 +3,14 @@
    format for llvm-profdata.
    HOS_PGO=<path>: every 500 ms, if <path>.reset exists the counters are cleared, and if <path>.dump exists they are written to <path>;
    each file is deleted when done. So a run can leave out the loading. */
+/* (linux port) Windows only: on Linux clang links compiler-rt's own profile runtime (LLVM_PROFILE_FILE=<path> names the
+   output; HOS_PGO's reset/dump files are not available there). */
+#ifdef _WIN32
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "win32_compat.h"
 
 int __llvm_profile_runtime = 0;
 
@@ -87,3 +90,4 @@ __attribute__((constructor)) static void pgo_start(void) {
     const char *e = getenv("HOS_PGO");
     if (e) CreateThread(NULL, 0, pgo_thread, _strdup(e), 0, NULL);
 }
+#endif /* _WIN32 */

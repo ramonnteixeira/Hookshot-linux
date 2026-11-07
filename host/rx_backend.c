@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 
 #include "../gpu/vk/vk_api.h"
 
@@ -188,7 +188,7 @@ static void flush_early(void) {
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
     const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-    char *slash = n ? strrchr(path, '\\') : NULL;
+    char *slash = n ? strrchr(path, HOS_SEP) : NULL;
     if (!slash) return NULL;
     strcpy(slash + 1, dll);
     HMODULE m = LoadLibraryA(path);

@@ -10,7 +10,7 @@
    decoder exists (HOS_AV1_ASYNC=1 to prefer it: untested). HOS_VIDEO_LOG=1 logs the decoder chosen. */
 #define COBJMACROS
 #include "hos.h"
-#include <windows.h>
+#include "win32_compat.h"
 #include <shellapi.h>
 #include <initguid.h>
 #include <mfapi.h>

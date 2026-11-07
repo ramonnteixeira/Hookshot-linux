@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 #include "../gpu/render/rx.h"
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0

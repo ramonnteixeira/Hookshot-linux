@@ -10,7 +10,7 @@
 #include <stddef.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 
 enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_HOLDER, K_TIMER };
 

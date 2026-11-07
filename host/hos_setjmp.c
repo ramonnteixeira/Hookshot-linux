@@ -28,7 +28,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <windows.h>
+#include "win32_compat.h"
 #include <string.h>
 
 #define DEPTH 256

@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 #include <mmsystem.h>
 
 void hos_system_event_init(uint64_t key, int autoclear);

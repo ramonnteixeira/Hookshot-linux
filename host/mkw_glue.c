@@ -5,7 +5,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
+#ifndef _WIN32
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 /* ---- the guest window ---------------------------------------------------------------------------------------
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
@@ -19,6 +23,7 @@ void hos_commit(uint64_t addr, uint64_t size) {
                 (unsigned long long)lo, GetLastError());
 }
 
+#ifdef _WIN32   /* (linux port: the whole window is mapped up front with MAP_NORESERVE: nothing to commit) */
 static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
@@ -37,9 +42,16 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
 
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
    state of the thread, as of its last call out of lifted code, with its frame chain from x29. */
+#endif
+
 static uint64_t peek_guest(uint64_t a) {
     MEMORY_BASIC_INFORMATION mbi;
+#ifdef _WIN32
     if (a >= HOS_GUEST_SPACE - 8 || !VirtualQuery(GP(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
+#else
+    (void)mbi;   /* (linux port: every page of the window reads, as zeros if untouched) */
+    if (a >= HOS_GUEST_SPACE - 8) return 0;
+#endif
     return G64(a);
 }
 
@@ -51,12 +63,13 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCSTR)rip, &mod))
         GetModuleFileNameA(mod, name, MAX_PATH);
-    const char *base = strrchr(name, '\\');
+    const char *base = strrchr(name, HOS_SEP);
     const uint64_t addr = rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0;
     hos_log("CRASH: exception %#lx (%s %#llx, guest %#llx) at %s+%#llx", rec->ExceptionCode,
             rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1 ? "write" : "read",
             (unsigned long long)addr, (unsigned long long)(addr - (uint64_t)A64_MEM), base ? base + 1 : name,
             (unsigned long long)(rip - (uint64_t)mod));
+#ifdef _WIN32
     {   /* the host stack from the faulting frame (x64 unwind data), as module+offset (nx2/samap.py maps mkw.exe's) */
         CONTEXT ctx = *info->ContextRecord;
         char hb[1024];
@@ -67,7 +80,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCSTR)ctx.Rip, &m))
                 GetModuleFileNameA(m, mn, MAX_PATH);
-            const char *mb = strrchr(mn, '\\');
+            const char *mb = strrchr(mn, HOS_SEP);
             n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)(ctx.Rip - (uint64_t)m));
             DWORD64 image = 0;
             PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
@@ -78,6 +91,23 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
         }
         hos_log("%s", hb);
     }
+#else
+    {   /* (linux port) the host stack: glibc's unwinder walks through the signal frame to the faulting one */
+        void *frames[24];
+        const int nf = backtrace(frames, 24);
+        char hb[1024];
+        int n = snprintf(hb, sizeof hb, "CRASH: host backtrace:");
+        for (int i = 0; i < nf && n < (int)sizeof hb - 48; i++) {
+            Dl_info di;
+            const char *mn = "?", *mb;
+            uintptr_t at = (uintptr_t)frames[i];
+            if (dladdr(frames[i], &di) && di.dli_fname) mn = di.dli_fname, at -= (uintptr_t)di.dli_fbase;
+            mb = strrchr(mn, '/');
+            n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)at);
+        }
+        hos_log("%s", hb);
+    }
+#endif
     Ctx *c = hos_ctx();
     if (c) {
         hos_log("CRASH: thread %s, sp %#llx", hos_thread_name(hos_self()), (unsigned long long)c->x[31]);
@@ -152,7 +182,9 @@ static LONG CALLBACK report_fatal(EXCEPTION_POINTERS *info) {
 }
 
 void hos_commit_init(void) {
+#ifdef _WIN32
     AddVectoredExceptionHandler(1, commit_on_touch);
+#endif
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
@@ -164,6 +196,7 @@ void hos_mods_init(const char *image_path) { (void)image_path; } /* (mods.c) */
 /* HOS_PROFILE=<seconds> (in place of TOTKPort's hos_prof.c): every interval, the process's busiest threads and their
    share of a core (guest threads by their guest names, host threads by their descriptions): which one a frame rate
    waits for */
+#ifdef _WIN32
 #include <tlhelp32.h>
 int hos_thread_handles(HANDLE *out, const char **names, int max);   /* hos_thread.c */
 static DWORD WINAPI prof_thread(void *p) {
@@ -584,6 +617,15 @@ void hos_prof_start(void) {
     const char *watch = getenv("HOS_WATCH");
     if (watch && *watch) CreateThread(NULL, 0, watch_thread, (void *)watch, 0, NULL);
 }
+#else
+/* (linux port) the samplers and the profiler suspend other threads and read their contexts (toolhelp snapshots,
+   SuspendThread, debug registers): not ported yet. perf(1) covers the same ground on Linux. */
+void hos_prof_start(void) {
+    static const char *const vars[] = {"HOS_THREAD_TIMES", "HOS_PROFILE", "HOS_SAMPLE", "HOS_SAMPLE_ALL", "HOS_WATCH"};
+    for (size_t i = 0; i < sizeof vars / sizeof *vars; i++)
+        if (getenv(vars[i])) hos_log("prof: %s is not available on Linux yet (use perf)", vars[i]);
+}
+#endif
 void hos_mem_checkpoint(const char *what) { (void)what; }        /* (hos_prof.c: HOS_MEM_TIMELINE) */
 int hos_game_cores(void) { return 0; }                           /* (totk_cores.c) */
 int hos_blank_cached_icon(const char *guest, const char *host) { (void)guest, (void)host; return 0; }   /* (TOTK) */
@@ -684,6 +726,7 @@ void hos_host_thread_register_self(const char *name) {   /* (hos_prof.c: names f
     wchar_t w[64];
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(GetCurrentThread(), w);
 }
+#ifdef _WIN32
 void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     typedef struct {
         DWORD cb, PageFaultCount;
@@ -700,3 +743,17 @@ void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     *private_bytes = m.PrivateUsage;
     *working_set = m.WorkingSetSize;
 }
+#else
+void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {   /* (linux port: /proc/self/status) */
+    *private_bytes = *working_set = 0;
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[128];
+    unsigned long long kb;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) *working_set = (uint64_t)kb << 10;
+        else if (sscanf(line, "RssAnon: %llu kB", &kb) == 1) *private_bytes = (uint64_t)kb << 10;
+    }
+    fclose(f);
+}
+#endif

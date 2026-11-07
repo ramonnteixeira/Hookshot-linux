@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 
 void hos_host_thread_register_self(const char *name);   /* hos_prof.c */
 

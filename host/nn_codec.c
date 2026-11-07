@@ -9,7 +9,7 @@
 #include <string.h>
 #include <opus.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 
 #define CODEC_MAGIC 0x4F505553u   /* 'OPUS' */
 #define MAX_DECODERS 64

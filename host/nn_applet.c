@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
+#include "win32_compat.h"   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
 
 static int64_t boot_ns;
 
@@ -91,7 +91,7 @@ static int handheld(void) {
         if (!getenv("HOS_HANDHELD")) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
             char path[MAX_PATH];
             const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-            char *slash = n ? strrchr(path, 92) : NULL;
+            char *slash = n ? strrchr(path, HOS_SEP) : NULL;
             if (slash) {
                 snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
                 FILE *f = fopen(path, "r");

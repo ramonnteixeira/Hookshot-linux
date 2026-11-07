@@ -3,7 +3,7 @@
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

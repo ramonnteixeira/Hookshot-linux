@@ -14,9 +14,10 @@
 #include <string.h>
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 #include <mmsystem.h>
 #else
+#include "win32_compat.h"   /* (linux port) */
 #include <sys/mman.h>
 #endif
 
@@ -113,6 +114,8 @@ static int reserve_guest(void) {
     hos_commit_init();
     return VirtualAlloc((void *)A64_HOST_BASE, GUEST_SPACE, MEM_RESERVE | watch, PAGE_NOACCESS) == (void *)A64_HOST_BASE;
 #else
+    void hos_commit_init(void);
+    hos_commit_init();   /* (linux port: the crash report and its handlers; nothing to commit on touch here) */
     return mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) == (void *)A64_HOST_BASE;
 #endif
@@ -191,13 +194,13 @@ int main(int argc, char **argv) {
     if (!image) {   /* (hookshot) started with nothing, as a game is: everything beside the executable (the builder's folder) */
         char dir[MAX_PATH];
         const DWORD len = GetModuleFileNameA(NULL, dir, MAX_PATH);
-        char *slash = len ? strrchr(dir, 92) : NULL;
+        char *slash = len ? strrchr(dir, HOS_SEP) : NULL;
         if (slash) {
             *slash = 0;
             SetCurrentDirectoryA(dir);
-            snprintf(beside_image, MAX_PATH, "%s\\image.bin", dir);
-            snprintf(beside_romfs, MAX_PATH, "%s\\romfs", dir);
-            snprintf(beside_user, MAX_PATH, "%s\\user", dir);
+            snprintf(beside_image, MAX_PATH, "%s" HOS_SEP_S "image.bin", dir);
+            snprintf(beside_romfs, MAX_PATH, "%s" HOS_SEP_S "romfs", dir);
+            snprintf(beside_user, MAX_PATH, "%s" HOS_SEP_S "user", dir);
             if (GetFileAttributesA(beside_image) != INVALID_FILE_ATTRIBUTES) {
                 image = beside_image;
                 if (!hos_romfs_dir) hos_romfs_dir = beside_romfs;
@@ -258,7 +261,7 @@ int main(int argc, char **argv) {
             int on = 0;
             char path[MAX_PATH];
             const DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
-            char *slash = len ? strrchr(path, 92) : NULL;
+            char *slash = len ? strrchr(path, HOS_SEP) : NULL;
             if (slash) {
                 snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
                 FILE *o = fopen(path, "r");

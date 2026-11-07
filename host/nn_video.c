@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "win32_compat.h"
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 
