@@ -30,6 +30,11 @@ OLD_FORMAT_PROBE = '\n'.join((
     'std::string t(int v) { return std::vformat("{}", std::make_format_args(v)); }', ""))
 
 
+
+# (linux port) the update advice is the platform's: Visual Studio on Windows, clang and its C++ library elsewhere
+UPDATE_HINT = "Visual Studio 2022" if os.name == "nt" else "clang 17"
+TOO_OLD = "@@error Your Visual Studio is too old" if os.name == "nt" else "@@error This clang's C++ library is too old"
+
 class Toolchain:
     def __init__(self, compiler, flags=()):
         self.compiler, self.flags = compiler, list(flags)
@@ -95,7 +100,7 @@ class CppPreflightTests(unittest.TestCase):
             make_game.check_cpp_library(toolchain)
         self.assertEqual(stopped.exception.code, 1)
         self.assertIn("ranges", output.getvalue())
-        self.assertIn("Visual Studio 2022", output.getvalue())
+        self.assertIn(UPDATE_HINT, output.getvalue())
 
     def test_failed_compiler_keeps_details_and_update_instructions(self):
         result = subprocess.CompletedProcess([], 1, "authored compiler output\n", "error: authored ranges failure\n")
@@ -107,8 +112,8 @@ class CppPreflightTests(unittest.TestCase):
         compile_run.assert_called_once()
         self.assertIn("authored compiler output", output.getvalue())
         self.assertIn("authored ranges failure", output.getvalue())
-        self.assertIn("@@error Your Visual Studio is too old", output.getvalue())
-        self.assertIn("Visual Studio 2022", output.getvalue())
+        self.assertIn(TOO_OLD, output.getvalue())
+        self.assertIn(UPDATE_HINT, output.getvalue())
 
     def test_library_failure_stops_check_and_build_before_reading_input(self):
         for check_only in (True, False):
@@ -144,7 +149,7 @@ class CppPreflightTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     make_game.main()
                 self.assertEqual(stopped.exception.code, 1)
-                self.assertIn("Visual Studio 2022", output.getvalue())
+                self.assertIn(UPDATE_HINT, output.getvalue())
                 compiler.assert_called_once()
                 run.assert_not_called()
                 for launch in launches:

@@ -26,7 +26,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = [sys.executable, "-I", "-u"]   # (-u: the steps' output as it comes, not in 8 KB blocks minutes apart)
 BUILD_ID = "e0f3ccfa"   # (the version the patches, the hot list and the profile were made from)
-BESIDE = ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"]
+BESIDE = (["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"] if os.name == "nt" else
+          ["hookshot", "hookshot_vk.so"])   # (linux port: SDL2, FFmpeg and Vulkan are the system's)
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -122,7 +123,7 @@ def check_cache_paths(out, paths):
 
 
 def check(a, work):
-    check_windows_sdk()   # (first: said in plain words when the game is chosen, not after it has been read)
+    check_toolchain()   # (first: said in plain words when the game is chosen, not after it has been read)
     if a.nup:
         probe = os.path.join(work, "probe")
         shutil.rmtree(probe, ignore_errors=True)
@@ -216,8 +217,49 @@ def check_cpp_library(toolchain):
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         print(r.stdout + r.stderr, flush=True)
+        if os.name != "nt":
+            fail("This clang's C++ library is too old for this game's renderer (C++20 <format> and ranges): install clang 17 or "
+                 "later with libstdc++ 13 or later (or libc++), then build again.")
         fail("Your Visual Studio is too old for this game's renderer. Open the Visual Studio Installer, press Update on "
              "Visual Studio 2022 (or install it), then build again.")
+
+
+def check_linux_toolchain():
+    """(linux port) What the build needs from the system, found now rather than 40 minutes in: clang and lld, the C++20 library,
+    FFmpeg's libraries, the Vulkan and SPIR-V headers. SDL2 and the Vulkan loader are only needed to run the game: said, not stopped on."""
+    sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
+    import toolchain
+    missing = [t for t in ("clang", "clang++") if not shutil.which(t) and not os.path.isfile(toolchain.find(t))]
+    if missing:
+        fail("%s not found: install clang (17 or later), e.g. sudo apt install clang lld" % " and ".join(missing))
+    if not shutil.which("ld.lld"):
+        print("ld.lld not found: linking with the system linker (install lld for the hot functions' ordering)", flush=True)
+    check_cpp_library(toolchain)
+    needs = []
+    r = subprocess.run(["pkg-config", "--exists", "libavcodec", "libswscale", "libswresample", "libavutil"]) if shutil.which("pkg-config") else None
+    if not r or r.returncode:
+        needs.append("FFmpeg's development files (Debian/Ubuntu: libavcodec-dev libswscale-dev libswresample-dev libavutil-dev pkg-config; "
+                     "Fedora: ffmpeg-free-devel; Arch: ffmpeg)")
+    if not (os.path.isfile("/usr/include/vulkan/vulkan.h") or os.environ.get("RX_CPM")):
+        needs.append("the Vulkan headers (Debian/Ubuntu: libvulkan-dev; Fedora: vulkan-headers; Arch: vulkan-headers)")
+    if not (os.path.isdir("/usr/include/spirv/unified1") or os.environ.get("RX_CPM")):
+        needs.append("the SPIR-V headers (Debian/Ubuntu: spirv-headers; Fedora: spirv-headers-devel; Arch: spirv-headers)")
+    if not (os.path.isfile("/usr/include/vk_mem_alloc.h") or os.environ.get("RX_VMA") or os.environ.get("RX_CPM")):
+        needs.append("Vulkan Memory Allocator (Debian/Ubuntu: libvulkan-memory-allocator-dev; Arch: vulkan-memory-allocator; "
+                     "or RX_VMA=<a VulkanMemoryAllocator checkout>)")
+    if needs:
+        fail("Missing to build the game: " + "; ".join(needs) + ".")
+    import ctypes.util
+    for lib, pkg in (("SDL2-2.0", "libsdl2-2.0-0"), ("vulkan", "libvulkan1 and your GPU's Vulkan driver")):
+        if not ctypes.util.find_library(lib):
+            print("%s was not found: the game needs it to run (%s)" % (lib, pkg), flush=True)
+
+
+def check_toolchain():
+    if os.name == "nt":
+        check_windows_sdk()
+    else:
+        check_linux_toolchain()
 
 
 def check_windows_sdk():
@@ -287,7 +329,8 @@ def main():
     p.add_argument("--romfs")
     p.add_argument("--exefs")
     p.add_argument("--out")
-    p.add_argument("--work", default=os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
+    p.add_argument("--work", default=os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME") or
+                                                  (os.path.expanduser("~/.local/share") if os.name != "nt" else ROOT), "HookshotBuilder"))
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     p.add_argument("--language", default="en-US", help="the game's language: a code from LANGUAGES, written to language.txt")
     p.add_argument("--check", action="store_true")
@@ -304,7 +347,7 @@ def main():
     out = os.path.abspath(a.out)
     work = os.path.abspath(a.work)
     os.makedirs(out, exist_ok=True)
-    check_windows_sdk()
+    check_toolchain()
     exefs = os.path.join(work, "exefs")
     romfs = os.path.join(out, "romfs")
 
