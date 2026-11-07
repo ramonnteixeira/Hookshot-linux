@@ -157,8 +157,8 @@ game than anyone has yet.
 
 Bigger ways to help:
 
-- **Linux support.** Hookshot only runs on Windows today. The Vulkan renderer is a good start, but the system layer
-  still needs porting.
+- **Linux support.** In progress on the `linux-port` branch: the system layer, the window, sound and the Vulkan renderer
+  build natively on Linux. See [docs/linux.md](docs/linux.md); testing with the game is the next step.
 - **Fixes in your own fork.** Fork the project, fix what you find and send the change back. Keep game files, keys and
   anything generated from your game out of it.
 
