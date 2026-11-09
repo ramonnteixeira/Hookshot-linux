@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 
 #define HOS_HOSTCALL_BASE 0x06000000ULL
 #define HOS_HOSTCALL_MAX 8192

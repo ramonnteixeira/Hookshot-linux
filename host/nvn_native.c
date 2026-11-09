@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "win32_compat.h"
+#include <windows.h>
 uint64_t hos_hostcall(const char *name, void (*fn)(Ctx *, void *), void *user);   /* hos_hostcall.c */
 void hos_gpu_track(uint64_t guest, uint64_t size, int on);                          /* nvdrv.c */
 
@@ -215,8 +215,10 @@ NV(nvnDeviceSetWindowOriginMode) {
 }
 NV(nvnDeviceSetDepthMode) {
     ((nvn_dev *)P(0))->depth_mode = U32(1);
-    InterlockedExchange(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
+    const LONG was = InterlockedExchange(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
     hos_log("nvn: depth mode %s", U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W ? "near = -w (GL)" : "near = 0");
+    if (was != (LONG)(depth_minus_w != 0))
+        hos_log("nvn: the depth mode is not the one the prepared shaders were made for: their vertex stages draw wrong");
 }
 NV(nvnDeviceFinalizeCommandHandle) {}
 /* (mkw-recomp) GPU time on the CPU's tick clock (31.25 MHz: 32 ns a tick), as on the console: MKW's frame pacer
@@ -276,7 +278,18 @@ NV(nvnMemoryPoolInitialize) {
     OLOG("pool %#llx size %#llx flags %#x", (unsigned long long)o->gpu, (unsigned long long)o->size, o->flags);
     RET(1);
 }
+/* (hookshot) A memory-pool call made with no pool: the game passed 0 while the banc changed (thread
+   OptimizeChangeBanc, Kakariko's day/night transition), and flags at +4 of it crashed. 0 then, and who asked, once.
+   P(0) returns NULL for a 0 argument, but dereferencing that NULL is undefined behaviour: the compiler folds the
+   check away and reads A64_MEM + offset instead, so the guard has to come before the dereference. */
+static int no_pool(Ctx *c, const char *what) {
+    if (c->x[0]) return 0;
+    static int told;
+    if (told++ < 4) hos_log("nvn: %s of no memory pool (lr %#llx): 0", what, (unsigned long long)c->x[30]);
+    return 1;
+}
 NV(nvnMemoryPoolFinalize) {
+    if (no_pool(c, "finalize")) return;
     nvn_pool *o = (nvn_pool *)P(0);
     if (o->vmap) {   /* (its GPU range is not reused) */
         int mapped = 0;   /* (pages still mapped: what the GPU drew there goes into their memory first) */
@@ -297,23 +310,35 @@ NV(nvnMemoryPoolFinalize) {
     }
     o->magic = 0;
 }
-NV(nvnMemoryPoolGetFlags) { RET(((const nvn_pool *)P(0))->flags); }
-NV(nvnMemoryPoolGetSize) { RET(((const nvn_pool *)P(0))->size); }
+NV(nvnMemoryPoolGetFlags) {
+    if (no_pool(c, "flags")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->flags);
+}
+NV(nvnMemoryPoolGetSize) {
+    if (no_pool(c, "size")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->size);
+}
 NV(nvnMemoryPoolMap) {
+    if (no_pool(c, "map")) { RET(0); return; }
     const nvn_pool *o = (const nvn_pool *)P(0);
     if (o->magic != NVN_MAGIC('P', 'O', 'O', 'L') || (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) { RET(0); return; }
     if (!o->mem) die("CPU mapping of a virtual pool");
     RETP(o->mem);
 }
-NV(nvnMemoryPoolGetBufferAddress) { RET(((const nvn_pool *)P(0))->gpu); }
+NV(nvnMemoryPoolGetBufferAddress) {
+    if (no_pool(c, "buffer address")) { RET(0); return; }
+    RET(((const nvn_pool *)P(0))->gpu);
+}
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
+    if (no_pool(c, "invalidate mapped range")) return;
     const nvn_pool *o = (const nvn_pool *)P(0);
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
 /* NVNmappingRequest (0x28 bytes): physical pool (guest pointer), physical offset, virtual offset, size, storage class */
 NV(nvnMemoryPoolMapVirtual) {
+    if (no_pool(c, "map virtual")) return;
     nvn_pool *v = (nvn_pool *)P(0);
     const int n = I(1);
     const uint8_t *r = (const uint8_t *)P(2);
@@ -395,9 +420,30 @@ NV(nvnBufferInitialize) {
     RET(1);
 }
 NV(nvnBufferFinalize) { memset(P(0), 0, sizeof(nvn_buffer)); }
+/* (hookshot, issue 287) A buffer with no memory pool, mapped: the game filled 0x3d0 bytes at what it got back, 0, and crashed
+   on a scene change (Hyrule Castle / Castle Town / Hyrule Field, Kakariko day to night; thread OptimizeChangeBanc, right after
+   "flags of no memory pool"). Zeroed scratch memory in the game's address space instead, as large as the biggest asked for
+   (never freed: it comes rarely), and who asked, once. */
+static uint64_t scratch_map(uint64_t size, uint64_t lr) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint64_t at, have;
+    static int told;
+    AcquireSRWLockExclusive(&lock);
+    if (size > have) {
+        have = (size + 0xffff) & ~0xffffull;
+        at = hos_sys_alloc(have, 0x1000);
+    }
+    const uint64_t r = at;
+    if (told++ < 4) hos_log("nvn: a buffer of no memory pool mapped (lr %#llx): %#llx bytes of scratch", (unsigned long long)lr,
+                            (unsigned long long)size);
+    ReleaseSRWLockExclusive(&lock);
+    return r;
+}
 NV(nvnBufferMap) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
-    if (!o->pool || !o->pool->mem) { RET(0); return; }
+    if (!o) { RET(0); return; }
+    if (!o->pool) { RET(scratch_map(o->size ? o->size : 0x1000, c->x[30])); return; }
+    if (!o->pool->mem) { RET(0); return; }
     RETP(o->pool->mem + o->off);
 }
 NV(nvnBufferGetAddress) {
@@ -439,8 +485,19 @@ NV(nvnSamplerPoolSetDebugLabel) {}
 NV(nvnSamplerPoolRegisterSampler) { rx_nvn_register_sampler(I(1), &((const nvn_samp *)P(2))->p); }
 
 /* ---- textures ---- */
-#define TB(p) ((nvn_tex_builder *)(p))
-#define CTB(p) ((const nvn_tex_builder *)(p))
+/* (hookshot) A texture builder of no address: a scratch one instead, said once. The game passed 0 after a long freeze (the
+   ocarina note sheet's first build, combat in Hyrule Field) and nvnTextureBuilderSetSwizzle read A64_MEM + 0x5c (issue 500);
+   a builder set up wrongly is a missing texture, not a crash. As PR 510 for memory pools. */
+static nvn_tex_builder *tb_or_scratch(void *p, uint64_t lr) {
+    static nvn_tex_builder scratch;
+    if (p) return (nvn_tex_builder *)p;
+    static volatile LONG told;
+    if (InterlockedIncrement(&told) <= 4) hos_log("nvn: a texture builder of no address (lr %#llx): a scratch one", (unsigned long long)lr);
+    memset(&scratch, 0, sizeof scratch);
+    return &scratch;
+}
+#define TB(p) tb_or_scratch((p), c->x[30])
+#define CTB(p) ((const nvn_tex_builder *)tb_or_scratch((p), c->x[30]))
 #define TX(p) ((nvn_tex *)(p))
 #define CTX(p) ((const nvn_tex *)(p))
 NV(nvnTextureBuilderSetDefaults) {
@@ -501,13 +558,23 @@ NV(nvnTextureBuilderGetPackagedTextureData) { RET(CTB(P(0))->pkg_data); }
 static int storage_class(const nvn_texdesc *d) { return d->target == NVN_TEXTURE_TARGET_BUFFER ? 0 : 1; }
 NV(nvnTextureBuilderGetStorageClass) { RET(storage_class(&CTB(P(0))->d)); }
 NV(nvnTextureBuilderGetFlags) { RET((uint32_t)CTB(P(0))->d.flags); }
+/* (hookshot, issues 284 and 287) A size or alignment asked of no builder: the game passed 0 here while a scene loaded (thread
+   OptimizeChangeBanc, entering Castle Town), and the format read at +4 of it crashed the game. Size 0 then, and who asked, once */
+static int no_builder(Ctx *c, const char *what) {
+    if (c->x[0]) return 0;
+    static int told;
+    if (told++ < 4) hos_log("nvn: %s of no texture builder (lr %#llx): 0", what, (unsigned long long)c->x[30]);
+    return 1;
+}
 NV(nvnTextureBuilderGetStorageSize) {
+    if (no_builder(c, "storage size")) { RET(0); return; }
     nvn_texlayout L;
     nvn_tex_layout(&CTB(P(0))->d, &L);
     if (!L.bpb) hos_log("nvn: texture format %#x unknown: storage size 0", CTB(P(0))->d.format);
     RET(L.size);
 }
 NV(nvnTextureBuilderGetStorageAlignment) {
+    if (no_builder(c, "storage alignment")) { RET(512); return; }
     nvn_texlayout L;
     nvn_tex_layout(&CTB(P(0))->d, &L);
     RET(L.align);
@@ -523,6 +590,7 @@ NV(nvnTextureBuilderGetSamples) { RET((uint32_t)CTB(P(0))->d.samples); }
 NV(nvnTextureBuilderGetStride) { RET(CTB(P(0))->d.stride); }
 NV(nvnTextureBuilderGetMemoryOffset) { RET((uint64_t)CTB(P(0))->off); }
 NV(nvnTextureBuilderGetViewOffset) {
+    if (no_builder(c, "view offset")) { RET(0); return; }
     const nvn_tex_builder *b = CTB(P(0));
     const nvn_view *w = (const nvn_view *)P(1);
     if (!w) { RET(0); return; }
@@ -707,7 +775,8 @@ static LONG CALLBACK wts_handler(EXCEPTION_POINTERS *e) {
             static int all_threads = -1;   /* RX_NVN_WATCH_ALL=1: the Resource Memory thread's writes too */
             if (all_threads < 0) all_threads = getenv("RX_NVN_WATCH_ALL") != NULL;
             if ((all_threads || strcmp(tn, "Resource Memory")) && GetTickCount64() >= after && InterlockedIncrement(&wts_reports) <= 12) {   /* (not the allocation's zero fill) */
-                hos_log("nvn: write to a WriteTexels source at guest %#llx by %s", (unsigned long long)(a - (uintptr_t)GP(0)), tn);
+                hos_log("nvn: write to a WriteTexels source at guest %#llx by %s (host pc exe+%#llx)", (unsigned long long)(a - (uintptr_t)GP(0)), tn,
+                        (unsigned long long)((uintptr_t)e->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleA(NULL)));
                 hos_backtrace();
             }
             DWORD old;
@@ -942,7 +1011,10 @@ static uint64_t held_count(void) { return (uint64_t)nheld; }
 
 NV(nvnQueueFenceSync) {
     held_init();
-    nvn_sync *s = (nvn_sync *)P(1); s->fenced = 1; s->fence = rx_nvn_fence() + held_count();
+    nvn_sync *s = (nvn_sync *)P(1); s->fenced = 1;
+    /* (hookshot) the queue's own work: with nothing held, its last submission (a wait for it no longer waits for another
+       queue's work stopped at an event wait) */
+    s->fence = held_count() ? rx_nvn_fence() + held_count() : rx_nvn_fence_q((uint64_t)(uintptr_t)P(0));
     if (sync_log()) hos_log("nvn: FenceSync %p -> %llu (lr %#llx)", (void *)s, (unsigned long long)s->fence, (unsigned long long)c->x[30]);
 }
 /* (the GPU waits the game makes: count and time by kind, logged every 5 s) */
@@ -2117,7 +2189,15 @@ NV(nvnQueueSubmitCommands) {
         resolve_deferred((uint8_t *)(uintptr_t)h[i]);
     }
     held_init();
-    if (!hold_on) { rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q); return; }
+    if (!hold_on) {
+        /* (the replay runs here, on this thread, for ~9 ms a frame (vk_replay.cpp submit_q, RX_VK_ASYNC off): the virtual
+           core is given up for it, as Present and AcquireTexture do, so the game's other threads run on it meanwhile.
+           Nothing in the replay runs guest code or needs the core) */
+        const int away = hos_vcore_away();
+        rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
+        if (away) hos_vcore_back();
+        return;
+    }
     EnterCriticalSection(&held_cs);
     if (nheld == (LONG)(sizeof held / sizeof *held)) {   /* (full: what is held goes now) */
         for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
@@ -2175,7 +2255,10 @@ NV(nvnWindowGetPresentInterval) { RET((uint32_t)((const nvn_win *)P(0))->interva
 /* the game picks its interval from its frame time; in real-time mode (nn_vi.c) frames are paced by our limiter */
 NV(nvnWindowSetPresentInterval) {
     nvn_win *o = (nvn_win *)P(0);
-    if (o->interval != I(1)) hos_log("nvn: the game sets present interval %d -> %d", o->interval, I(1)), hos_backtrace();
+    {   /* (OoT changes it several times a second: logged with a backtrace only the first times, it was a syscall-heavy cost) */
+        static int told;
+        if (o->interval != I(1) && told++ < 6) hos_log("nvn: the game sets present interval %d -> %d", o->interval, I(1)), hos_backtrace();
+    }
     extern volatile uint64_t hos_mkw_pacer;   /* (nn_vi.c: its frame pacer, which calls this from 0x806bce24) */
     if (hos_game_is_mkw() && c->x[30] == 0x806bce28) hos_mkw_pacer = c->x[19];
     int hos_vi_native_interval(Ctx *c, int requested);

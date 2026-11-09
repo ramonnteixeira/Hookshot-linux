@@ -1,0 +1,226 @@
+# What a Windows player downloads, made without game data: HookshotBuilder-Setup.exe (builder/setup/setup.c, with
+# llvm-mingw) and the Hookshot Builder package (dotnet publish, versioned from the tag as docs/versioning.md says), split
+# into the parts the setup downloads by scripts/make_setup_parts.py. The Python, emsdk, CPM and wgpu-native parts, and the
+# third_party part's prebuilt files, are the latest release's (scripts/release_parts.py). The Windows Vulkan back end is
+# compiled too, with the same llvm-mingw: players build it on their PC, this only checks that it still builds.
+# A workflow artifact on every run; on a tag, the new parts go to the builder-parts release and the setup
+# (HookshotBuilder.exe) and its list (hookshot-setup.txt) to the tag's release, beside the Linux AppImage.
+name: Windows builder
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Hookshot Builder package and setup
+    # (builder-parts holds the installer's parts: no package there)
+    if: github.ref_name != 'builder-parts'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # (the version is git describe's: the tags and the history since them)
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Set up .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: llvm-mingw version
+        id: llvm
+        run: echo "name=$(python -I scripts/release_parts.py llvm-mingw --name)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm
+          key: ${{ steps.llvm.outputs.name }}
+      - name: llvm-mingw
+        run: echo "LLVM_MINGW=$(python -I scripts/release_parts.py llvm-mingw "$RUNNER_TEMP/llvm")" >> "$GITHUB_ENV"
+
+      # (a tag is its own version; any other commit is git describe's: v2.0.1-3-g1a2b3c4, version 2.0.1-3-g1a2b3c4)
+      - name: Version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=$(git describe --tags --match 'v[0-9]*' 2>/dev/null || echo "v0.0.0-$(git rev-parse --short HEAD)")
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=${tag#v}" >> "$GITHUB_ENV"
+          echo "version: $tag"
+
+      # (the list of the newest stable release other than this tag: its Python, emsdk, CPM, wgpu-native and third_party
+      # parts and its play profile. A fork with no release takes upstream's. A release must have one; any other run goes
+      # on without, and its package lacks those parts)
+      - name: The latest release's setup list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if python -I scripts/release_parts.py previous "$RUNNER_TEMP/previous-setup.txt" \
+              --repo "$GITHUB_REPOSITORY" --repo NotRexed/Hookshot --skip-tag "$TAG"; then
+            echo "PREVIOUS=$RUNNER_TEMP/previous-setup.txt" >> "$GITHUB_ENV"
+          elif [[ $GITHUB_REF == refs/tags/* ]]; then
+            exit 1
+          else
+            echo "::warning::no earlier release's setup list: the package has only the app and .NET parts"
+          fi
+
+      # (work/hookshot.ico is the builder's icon, builder/HookshotBuilder/HookshotBuilder.csproj)
+      - name: Play profile
+        if: env.PREVIOUS != ''
+        run: python -I scripts/release_parts.py profile "$PREVIOUS" work
+
+      - name: HookshotBuilder-Setup.exe
+        working-directory: builder/setup
+        run: |
+          "$LLVM_MINGW/bin/x86_64-w64-mingw32-windres" setup.rc -O coff -o "$RUNNER_TEMP/setup_rc.o"
+          "$LLVM_MINGW/bin/x86_64-w64-mingw32-clang" -O2 -mwindows -municode setup.c "$RUNNER_TEMP/setup_rc.o" \
+            -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lole32 -o "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
+          ls -l "$RUNNER_TEMP/HookshotBuilder-Setup.exe"
+
+      - name: Hookshot Builder
+        run: >-
+          dotnet publish builder/HookshotBuilder/HookshotBuilder.csproj --configuration Release
+          -p:Version="$VERSION" -p:NuGetAudit=false --output "$RUNNER_TEMP/publish"
+
+      - name: Package folder
+        run: >-
+          python -I scripts/release_parts.py package "$RUNNER_TEMP/package"
+          --publish "$RUNNER_TEMP/publish" --setup "$RUNNER_TEMP/HookshotBuilder-Setup.exe" ${PREVIOUS:+--list "$PREVIOUS"}
+
+      - name: Setup parts
+        run: |
+          python -I scripts/make_setup_parts.py "$RUNNER_TEMP/package" "$TAG" dist \
+            --base "https://github.com/$GITHUB_REPOSITORY/releases/download/builder-parts" ${PREVIOUS:+--reuse "$PREVIOUS"}
+          # (a release holds the setup as HookshotBuilder.exe: builder/HookshotBuilder/Updater.cs)
+          cp "$RUNNER_TEMP/HookshotBuilder-Setup.exe" dist/HookshotBuilder.exe
+          cat dist/hookshot-setup.txt
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: HookshotBuilder-windows
+          path: dist/
+          if-no-files-found: error
+
+  vulkan:
+    name: Windows Vulkan back end (llvm-mingw)
+    if: github.ref_name != 'builder-parts'
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (the headers in the CPM cache layout nx2/build.py reads, at the versions scripts/linux/deps.sh pins)
+      - name: Check out pinned Vulkan headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 74d8a6cb930c68ef617b202c3ff3c59d919e086b # v1.4.345
+          path: _deps/cpm/vulkanheaders/v1.4.345
+          persist-credentials: false
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 04f10f650d514df88b76d25e83db360142c7b174 # vulkan-sdk-1.4.341.0
+          path: _deps/cpm/spirv-headers/vulkan-sdk-1.4.341.0
+          persist-credentials: false
+      - name: Check out pinned VulkanMemoryAllocator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+          ref: 1d8f600fd424278486eade7ed3e877c99f0846b1 # v3.3.0
+          path: _deps/cpm/vulkanmemoryallocator/v3.3.0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: llvm-mingw version
+        id: llvm
+        run: echo "name=$(python -I scripts/release_parts.py llvm-mingw --name)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm
+          key: ${{ steps.llvm.outputs.name }}
+      - name: llvm-mingw
+        run: echo "HOOKSHOT_MINGW=$(python -I scripts/release_parts.py llvm-mingw "$RUNNER_TEMP/llvm")" >> "$GITHUB_ENV"
+      # (as scripts/linux/appimage.sh builds Linux's: the back end alone, no lift, no game)
+      - name: hookshot_vk.dll
+        env:
+          RX_VK_ONLY: '1'
+          RX_RELEASE: '1'
+        run: |
+          OOT_WORK="$RUNNER_TEMP/vk-work" RX_CPM="$GITHUB_WORKSPACE/_deps/cpm" \
+            python -I nx2/build.py --standalone --jobs "$NUMBER_OF_PROCESSORS"
+          ls -l "$RUNNER_TEMP/vk-work/sa/build/hookshot_vk.dll"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hookshot_vk-windows
+          path: ${{ runner.temp }}/vk-work/sa/build/hookshot_vk.dll
+          if-no-files-found: error
+
+  release:
+    name: Release assets
+    # (off until the maintainer switches it on: releases are published by hand with HookshotBuilder.exe and hookshot-setup.txt,
+    # and a second upload of them on the tag would race that. Set vars.CI_RELEASE_WINDOWS to 'true' to turn it on)
+    if: startsWith(github.ref, 'refs/tags/') && github.ref_name != 'builder-parts' && vars.CI_RELEASE_WINDOWS == 'true'
+    needs: [package, vulkan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: HookshotBuilder-windows
+          path: dist
+      # (named by their SHA-256: a part already there is the same file and is not uploaded again. Before the list, which
+      # names them)
+      - name: New parts to builder-parts
+        run: |
+          if ! gh release view builder-parts >/dev/null 2>&1; then
+            gh release create builder-parts --prerelease --latest=false --target "$GITHUB_SHA" --title builder-parts \
+              --notes "The parts HookshotBuilder-Setup.exe downloads, named by each release's hookshot-setup.txt."
+          fi
+          have=$(gh release view builder-parts --json assets --jq '.assets[].name')
+          for f in dist/HookshotBuilder-*.zip; do
+            if grep -qxF "$(basename "$f")" <<<"$have"; then
+              echo "$(basename "$f"): already there"
+            else
+              gh release upload builder-parts "$f"
+            fi
+          done
+      - name: Setup and its list to the release
+        run: scripts/release_upload.sh "$GITHUB_REF_NAME" dist/HookshotBuilder.exe dist/hookshot-setup.txt

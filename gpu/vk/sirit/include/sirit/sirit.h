@@ -67,6 +67,9 @@ public:
     /// Sets module memory model.
     void SetMemoryModel(spv::AddressingModel addressing_model_, spv::MemoryModel memory_model_);
 
+    /// Sets the memory model while preserving the module's addressing model.
+    void SetMemoryModel(spv::MemoryModel memory_model_);
+
     /// Adds an entry point.
     void AddEntryPoint(spv::ExecutionModel execution_model, Id entry_point, std::string_view name,
                        std::span<const Id> interfaces = {});
@@ -373,6 +376,9 @@ public:
         OpStore(Id pointer, Id object, Ts&&... memory_access) {
         return OpStore(pointer, object, std::span<const MemoryAccessLiteral>({memory_access...}));
     }
+
+    /// (EvilOOT) Length of a run-time array: the last member of the structure the pointer points to.
+    Id OpArrayLength(Id result_type, Id structure, std::uint32_t array_member);
 
     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
     Id OpAccessChain(Id result_type, Id base, std::span<const Id> indexes = {});

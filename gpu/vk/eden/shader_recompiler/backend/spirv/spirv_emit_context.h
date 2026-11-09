@@ -306,6 +306,7 @@ public:
     u32 rescaling_downfactor_member_index{};
     u32 guest_pages_member_index{};   // (hookshot: GUEST_PAGES_PUSH_OFFSET's member, compute only)
     bool wants_guest_pages{};
+    Id probe_log{};   // (EvilOOT, RX_VK_BLOCK_PROBE: the miss log's U32 storage buffer, per-block entry counters at word 128+)
     u32 mesh_first_member_index{};    // (hookshot: MESH_FIRST_PUSH_OFFSET's member, task programs)
     bool wants_mesh_first{};
     Id mesh_first_block_pointer{};    // (a PhysicalStorageBuffer pointer to a block of one u32, and to its member)
@@ -354,6 +355,7 @@ public:
     };
     std::vector<GlobalTableVars> ssbo_tables;
     std::array<Id, 9> atomic_global_func_u32{};
+    Id atomic_global_cas_func_u32{};   // (hookshot) (address, comparator, value) -> the old value
 
     Id load_global_func_u32{};
     Id load_global_func_u32x2{};
@@ -361,6 +363,8 @@ public:
     Id write_global_func_u32{};
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
+    Id write_global_cas_loop_func{};
+    Id atomic_global_add_f32_func{};   // (hookshot) (address, value) -> the old value
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -403,9 +407,25 @@ public:
     u32 mesh_map_bytes{};
     u32 mesh_primitive_base{}; ///< first word of the per-primitive groups
     std::vector<MeshLineTarget> mesh_vertex_targets;
+    // (hookshot) a vertex generic output and the components no vertex line writes: they get (0,0,0,1) as in the vertex stage
+    struct MeshDefault {
+        Id variable;
+        u32 missing;
+    };
+    std::vector<MeshDefault> mesh_vertex_defaults;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};
+
+    // (hookshot) a GPU without VK_EXT_mesh_shader: Task and Mesh are compute shaders. Their stage buffer outputs go to
+    // the payload, map and record buffers, pushed as device addresses; a generated vertex stage reads the records.
+    bool mesh_fallback{};
+    bool wants_mesh_fallback{};
+    Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
+    u32 mesh_fallback_payload_member_index{};
+    u32 mesh_fallback_records_member_index{};
+    /// A pointer to the u32 at a PhysicalStorageBuffer device address
+    Id MeshFallbackWord(Id address);
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};

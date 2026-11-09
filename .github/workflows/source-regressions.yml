@@ -1,24 +1,14 @@
+# Every game-free check, on every pull request to main or dev and every push to them: tests/run_all.py runs each
+# tests/test_*.py and nx2/test_*.py (all of them, even after a failure), the C++ unit tests under gpu/vk/tests and a
+# byte-compile of every tracked Python file, and writes a table of them to the run's summary. Its skip list says which
+# checks need a GPU, the game or MSVC, and why. No game data is involved.
 name: Game-free source regressions
 
 on:
   push:
-    branches: [main]
-    paths:
-      - nx2/nup.py
-      - nx2/make_game.py
-      - nx2/unpack.py
-      - nx2/test_nup_paths.py
-      - tests/test_make_game_cache.py
-      - .github/workflows/source-regressions.yml
+    branches: [main, dev]
   pull_request:
-    branches: [main]
-    paths:
-      - nx2/nup.py
-      - nx2/make_game.py
-      - nx2/unpack.py
-      - nx2/test_nup_paths.py
-      - tests/test_make_game_cache.py
-      - .github/workflows/source-regressions.yml
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -36,17 +26,194 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 04f10f650d514df88b76d25e83db360142c7b174 # vulkan-sdk-1.4.341.0
+          path: _deps/spirv-headers
+          persist-credentials: false
+      - name: Check out pinned Vulkan headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 74d8a6cb930c68ef617b202c3ff3c59d919e086b # v1.4.345
+          path: _deps/vulkan-headers
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      # (the one package a test imports: nx2/test_nup_codec.py's zstandard. The runner itself needs none)
+      - name: Python packages for the tests
+        run: python -m pip install --disable-pip-version-check --no-deps zstandard==0.25.0
+      - name: Compilers and the SPIR-V validator
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools
+
+      # (the steps below all run when one before them failed, so one run shows every failure)
+      - name: Check Windows native source regressions
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: cmd
+        run: |
+          @echo off
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" (
+            echo Visual Studio locator not found.
+            exit /b 1
+          )
+          set "VSROOT="
+          for /f "usebackq delims=" %%i in (`call "%VSWHERE%" -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+          if not defined VSROOT (
+            echo Visual Studio 2022 C++ tools not found.
+            exit /b 1
+          )
+          if not exist "%VSROOT%\Common7\Tools\VsDevCmd.bat" (
+            echo Visual Studio developer command prompt not found.
+            exit /b 1
+          )
+          call "%VSROOT%\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          where cl
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /W4 /WX /EHsc /Fo"%TEMP%\present_rect_test.obj" /Fe:"%TEMP%\present_rect_test.exe" gpu\vk\tests\present_rect_test.cpp
+          if errorlevel 1 exit /b 1
+          "%TEMP%\present_rect_test.exe"
+          if errorlevel 1 exit /b 1
+          python -I -B tests/test_invalidate_vcore.py --cxx cl
+          if errorlevel 1 exit /b 1
+      - name: Set up .NET for Windows Builder checks
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '8.0.x'
+      - name: Check Windows Builder worker delivery
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          dotnet restore tests/builder_workers/BuilderWorkersTests.csproj --configfile tests/builder_workers/NuGet.Config
+          dotnet run --project tests/builder_workers/BuilderWorkersTests.csproj --configuration Release --no-restore -- (Get-Command python).Source
+      - name: Compile Windows Builder
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        run: dotnet build builder/HookshotBuilder/HookshotBuilder.csproj --configuration Debug -p:NuGetAudit=false
+      # (--strict: a check whose compiler, headers or package is missing here fails instead of being skipped)
+      - name: Every test
+        if: ${{ !cancelled() }}
+        env:
+          HOOKSHOT_SPIRV_HEADERS: ${{ github.workspace }}/_deps/spirv-headers/include
+          HOOKSHOT_VULKAN_HEADERS: ${{ github.workspace }}/_deps/vulkan-headers/include
+        run: python -I -B tests/run_all.py --strict
+
+  spirv-global16:
+    name: SPIR-V global narrow load/store lowering
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 496543121ce6419f23d6fa5d7194ba66c36212d2
+          path: _deps/spirv-headers
+          persist-credentials: false
+      - name: Install Clang C++20 and SPIR-V validator
+        run: sudo apt-get update && sudo apt-get install -y clang spirv-tools
+      - name: Configure the focused real-IR fixture
+        run: >-
+          CC=clang CXX=clang++ cmake -S tests/global_load_16 -B ${{ runner.temp }}/global-load-16
+          -DREPO_ROOT=${{ github.workspace }}
+          -DSPIRV_HEADERS_ROOT=${{ github.workspace }}/_deps/spirv-headers
+      - name: Build the focused fixture
+        run: cmake --build ${{ runner.temp }}/global-load-16 --parallel 2
+      - name: Emit and inspect real IR modules
+        run: ${{ runner.temp }}/global-load-16/global_load_16_ir ${{ runner.temp }}/global-load-16/modules
+      - name: Check real-IR compare-exchange loop contracts
+        env:
+          RX_VK_FOLLOW_STORES: '1'
+        run: ${{ runner.temp }}/global-load-16/global_load_16_ir --cas-loops ${{ runner.temp }}/global-load-16/modules
+      - name: Validate every emitted module
+        shell: bash
+        # (--uniform-buffer-standard-layout: the back end's device has uniformBufferStandardLayout, gpu/vk/vk_main.cpp
+        # creates it with every feature the GPU reports, so constant buffers are u32 arrays of stride 4)
+        run: |
+          for module in "${{ runner.temp }}"/global-load-16/modules/*.spv; do
+            spirv-val --target-env vulkan1.3 --uniform-buffer-standard-layout "$module"
+          done
+      - name: Configure the authored direct surface atomic fixture
+        run: >-
+          CC=clang CXX=clang++ cmake -S tests/native_suatom -B ${{ runner.temp }}/native-suatom
+          -DREPO_ROOT=${{ github.workspace }}
+          -DSPIRV_HEADERS_ROOT=${{ github.workspace }}/_deps/spirv-headers
+      - name: Build the direct surface atomic fixture
+        run: cmake --build ${{ runner.temp }}/native-suatom --parallel 2
+      - name: Translate authored direct surface atomic programs
+        run: ${{ runner.temp }}/native-suatom/native_suatom ${{ runner.temp }}/native-suatom/modules
+      - name: Validate every direct surface atomic module
+        shell: bash
+        run: |
+          for module in "${{ runner.temp }}"/native-suatom/modules/*.spv; do
+            spirv-val --target-env vulkan1.3 "$module"
+          done
+
+  spirv-f2i-immediate:
+    name: Native F2I immediate lowering
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: '3.12'
-      - name: Check extraction boundaries
-        run: python -I -B nx2/test_nup_paths.py
-      - name: Check source-cache coherency
-        run: python -I -B tests/test_make_game_cache.py
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 496543121ce6419f23d6fa5d7194ba66c36212d2
+          path: _deps/spirv-headers
+          persist-credentials: false
+      - name: Install Clang and validator
+        run: sudo apt-get update && sudo apt-get install -y clang spirv-tools
+      - name: Build the focused fixture
+        run: |
+          CC=clang CXX=clang++ cmake -S tests/f2i_immediate -B "${{ runner.temp }}/f2i" -DREPO_ROOT="${{ github.workspace }}" -DSPIRV_HEADERS_ROOT="${{ github.workspace }}/_deps/spirv-headers"
+          cmake --build "${{ runner.temp }}/f2i" --parallel 2
+      - name: Emit and validate authored modules
+        run: |
+          "${{ runner.temp }}/f2i/f2i_immediate" "${{ runner.temp }}/f2i/modules"
+          for module in "${{ runner.temp }}"/f2i/modules/*.spv; do
+            spirv-val --target-env vulkan1.3 --uniform-buffer-standard-layout "$module"
+          done
+
+  actionlint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (the release's own binary, checked against its published SHA-256; shellcheck from the runner image checks the
+      # run: scripts)
+      - name: actionlint 1.7.12
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL --retry 5 --retry-delay 10 -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v$VERSION/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      - name: Lint the workflows
+        run: '"$RUNNER_TEMP/actionlint" -color'

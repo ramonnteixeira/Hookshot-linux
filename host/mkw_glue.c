@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -18,12 +18,32 @@
 void hos_commit(uint64_t addr, uint64_t size) {
     if (!size) return;
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
-    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE))
+    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
+        const DWORD err = GetLastError();
         hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)(hi - lo),
-                (unsigned long long)lo, GetLastError());
+                (unsigned long long)lo, err);
+        if (err == ERROR_COMMITMENT_LIMIT) {   /* (1455: RAM and page file full; the game crashes soon after. Said once, on its own thread) */
+            static volatile LONG said;
+            if (InterlockedExchange(&said, 1) == 0) {
+                hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
+                extern DWORD WINAPI hos_out_of_memory_box(LPVOID);
+                CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
+            }
+        }
+    }
 }
 
-#ifdef _WIN32   /* (linux port: the whole window is mapped up front with MAP_NORESERVE: nothing to commit) */
+DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
+    (void)unused;
+    MessageBoxA(NULL,
+                "Windows has run out of memory (RAM plus the page file), so Hookshot may close.\n\n"
+                "Close other programs, and in Windows' System > About > Advanced system settings > Performance > Advanced > Virtual "
+                "memory, choose \"Automatically manage paging file size\" (or give it at least 16 GB). A lower Quality preset in the "
+                "Insert menu also uses less memory.",
+                "Hookshot: out of memory", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    return 0;
+}
+
 static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
     if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
@@ -42,16 +62,9 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
 
 /* A crash nothing handles: what, where (mkw.exe+offset: nx2/dllmap.py reads mkw.map the same way), and the guest
    state of the thread, as of its last call out of lifted code, with its frame chain from x29. */
-#endif
-
 static uint64_t peek_guest(uint64_t a) {
     MEMORY_BASIC_INFORMATION mbi;
-#ifdef _WIN32
     if (a >= HOS_GUEST_SPACE - 8 || !VirtualQuery(GP(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-#else
-    (void)mbi;   /* (linux port: every page of the window reads, as zeros if untouched) */
-    if (a >= HOS_GUEST_SPACE - 8) return 0;
-#endif
     return G64(a);
 }
 
@@ -63,7 +76,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCSTR)rip, &mod))
         GetModuleFileNameA(mod, name, MAX_PATH);
-    const char *base = strrchr(name, HOS_SEP);
+    const char *base = strrchr(name, '\\');
     const uint64_t addr = rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0;
     hos_log("CRASH: exception %#lx (%s %#llx, guest %#llx) at %s+%#llx", rec->ExceptionCode,
             rec->NumberParameters > 1 && rec->ExceptionInformation[0] == 1 ? "write" : "read",
@@ -80,7 +93,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCSTR)ctx.Rip, &m))
                 GetModuleFileNameA(m, mn, MAX_PATH);
-            const char *mb = strrchr(mn, HOS_SEP);
+            const char *mb = strrchr(mn, '\\');
             n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)(ctx.Rip - (uint64_t)m));
             DWORD64 image = 0;
             PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
@@ -92,18 +105,19 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
         hos_log("%s", hb);
     }
 #else
-    {   /* (linux port) the host stack: glibc's unwinder walks through the signal frame to the faulting one */
-        void *frames[24];
-        const int nf = backtrace(frames, 24);
+    {   /* (hookshot) Linux: the host stack as module+offset, from glibc (the frames above the signal's included): the
+           x64 unwind data is Windows' */
+        void *pcs[24];
+        const int got = backtrace(pcs, 24);
         char hb[1024];
         int n = snprintf(hb, sizeof hb, "CRASH: host backtrace:");
-        for (int i = 0; i < nf && n < (int)sizeof hb - 48; i++) {
-            Dl_info di;
+        for (int i = 0; i < got && n < (int)sizeof hb - 48; i++) {
+            Dl_info d;
             const char *mn = "?", *mb;
-            uintptr_t at = (uintptr_t)frames[i];
-            if (dladdr(frames[i], &di) && di.dli_fname) mn = di.dli_fname, at -= (uintptr_t)di.dli_fbase;
+            uint64_t off = (uint64_t)(uintptr_t)pcs[i];
+            if (dladdr(pcs[i], &d) && d.dli_fname) mn = d.dli_fname, off -= (uint64_t)(uintptr_t)d.dli_fbase;
             mb = strrchr(mn, '/');
-            n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)at);
+            n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)off);
         }
         hos_log("%s", hb);
     }
@@ -182,9 +196,7 @@ static LONG CALLBACK report_fatal(EXCEPTION_POINTERS *info) {
 }
 
 void hos_commit_init(void) {
-#ifdef _WIN32
     AddVectoredExceptionHandler(1, commit_on_touch);
-#endif
     AddVectoredExceptionHandler(0, report_fatal);
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
@@ -192,7 +204,6 @@ void hos_commit_init(void) {
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */
-void hos_mods_init(const char *image_path) { (void)image_path; } /* (mods.c) */
 /* HOS_PROFILE=<seconds> (in place of TOTKPort's hos_prof.c): every interval, the process's busiest threads and their
    share of a core (guest threads by their guest names, host threads by their descriptions): which one a frame rate
    waits for */
@@ -617,24 +628,13 @@ void hos_prof_start(void) {
     const char *watch = getenv("HOS_WATCH");
     if (watch && *watch) CreateThread(NULL, 0, watch_thread, (void *)watch, 0, NULL);
 }
-#else
-/* (linux port) the samplers and the profiler suspend other threads and read their contexts (toolhelp snapshots,
-   SuspendThread, debug registers): not ported yet. perf(1) covers the same ground on Linux. */
-void hos_prof_start(void) {
-    static const char *const vars[] = {"HOS_THREAD_TIMES", "HOS_PROFILE", "HOS_SAMPLE", "HOS_SAMPLE_ALL", "HOS_WATCH"};
-    for (size_t i = 0; i < sizeof vars / sizeof *vars; i++)
-        if (getenv(vars[i])) hos_log("prof: %s is not available on Linux yet (use perf)", vars[i]);
-}
-#endif
+#endif   /* (linux) host/posix/prof.c */
 void hos_mem_checkpoint(const char *what) { (void)what; }        /* (hos_prof.c: HOS_MEM_TIMELINE) */
 int hos_game_cores(void) { return 0; }                           /* (totk_cores.c) */
 int hos_blank_cached_icon(const char *guest, const char *host) { (void)guest, (void)host; return 0; }   /* (TOTK) */
 int hos_ultrawide_redirect(const char *guest, char *out, size_t cap) { (void)guest, (void)out, (void)cap; return 0; }
 uint64_t hos_title_input(uint64_t buttons) { return buttons; }   /* (totk_title.c) */
 uint64_t hos_frame_step_buttons(uint64_t buttons) { return buttons; }   /* (nn_vi.c) */
-int hos_mods_dir_extras(const char *rel, const char *base_dir, void (*fn)(void *, const char *, int, uint64_t),
-                        void *arg) { (void)rel, (void)base_dir, (void)fn, (void)arg; return 0; }   /* (mods.c) */
-int hos_mods_romfs(const char *rel, char *out, size_t cap) { (void)rel, (void)out, (void)cap; return 0; }
 /* (hookshot) hos_sdl_pads, hos_sdl_rumble: host/pad_sdl.c (from TOTKPort; SDL2.dll beside the exe) */
 
 /* TOTK's emulated GPU (gpu.c, its Maxwell command processor), which nvdrv.c and the debug commands call into: MKW
@@ -726,7 +726,6 @@ void hos_host_thread_register_self(const char *name) {   /* (hos_prof.c: names f
     wchar_t w[64];
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(GetCurrentThread(), w);
 }
-#ifdef _WIN32
 void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     typedef struct {
         DWORD cb, PageFaultCount;
@@ -743,17 +742,3 @@ void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {
     *private_bytes = m.PrivateUsage;
     *working_set = m.WorkingSetSize;
 }
-#else
-void hos_process_memory(uint64_t *private_bytes, uint64_t *working_set) {   /* (linux port: /proc/self/status) */
-    *private_bytes = *working_set = 0;
-    FILE *f = fopen("/proc/self/status", "r");
-    if (!f) return;
-    char line[128];
-    unsigned long long kb;
-    while (fgets(line, sizeof line, f)) {
-        if (sscanf(line, "VmRSS: %llu kB", &kb) == 1) *working_set = (uint64_t)kb << 10;
-        else if (sscanf(line, "RssAnon: %llu kB", &kb) == 1) *private_bytes = (uint64_t)kb << 10;
-    }
-    fclose(f);
-}
-#endif

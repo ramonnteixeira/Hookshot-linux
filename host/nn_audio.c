@@ -11,19 +11,16 @@
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
-   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence. */
+   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
+   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs). */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
-#ifdef _WIN32
+#include <windows.h>
 #include <mmsystem.h>
-#else
-#include "sdl_dyn.h"   /* (linux port: the sound goes out through SDL2) */
-#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -567,46 +564,84 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
     }
 }
 
+/* (the output's platform parts, outside the section tests/audio_output_errors_test.c compiles with its own) */
+static unsigned au_device_count(void) {
+#ifdef _WIN32
+    return waveOutGetNumDevs();
+#else
+    return 0;   /* (linux: waveOut is SDL's default device) */
+#endif
+}
+static void au_device_name(unsigned device, char *out, size_t size) {
+    snprintf(out, size, "device %u", device);
+#ifdef _WIN32
+    WAVEOUTCAPSA caps;
+    if (waveOutGetDevCapsA(device, &caps, sizeof caps) == MMSYSERR_NOERROR) snprintf(out, size, "%s", caps.szPname);
+#endif
+}
+static uint64_t au_ms(void) { return (uint64_t)GetTickCount64(); }
+/* HOS_AUDIO_MUTE=1 (test runs): the device opened and fed as for a player, at volume 0 */
+static void au_opened(HWAVEOUT w) {
+#ifdef _WIN32
+    if (getenv("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
+#else
+    (void)w;
+#endif
+}
+
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
-#ifdef _WIN32
 static HWAVEOUT wout;
 static WAVEHDR hdr[NBLOCKS];
 static int16_t blocks[NBLOCKS][FRAME * 2 * 2];
 static int fill_block, fill_frames;
-#else
-/* (linux port) an SDL2 audio device in queue mode: as many 10 ms blocks may wait in it as waveOut had headers, and a
-   frame that would go past that is dropped (the device is behind), as on Windows */
-static const SdlDyn *sdl_out;
-static uint32_t sdl_dev;
-#endif
 static FILE *dump;
 static uint32_t dump_bytes;
 
+static void output_error(const char *operation, MMRESULT result) {
+    static unsigned logged;
+    if (logged < 8) {
+        logged++;
+        hos_log("audio: %s failed (MMRESULT %u)", operation, (unsigned)result);
+    }
+}
+/* The device: HOS_AUDIO_DEVICE=<n> (a waveOut device number) first, then the Windows default (WAVE_MAPPER), then each
+   device in turn. Players had no sound at all while every other program played ("no sound in 2.0.5"): the log now
+   names the device; one that takes no block for 1.5 s (an unplugged headset, a default bound to a dead output) is
+   closed and the next candidate opened (at most 6 times a run); 10 s after opening the log says how many blocks the
+   device took and how loud the game's sound was, which tells a silent game from a deaf device. */
+static int out_next;           /* the next candidate: 0 = HOS_AUDIO_DEVICE, 1 = the default, 2.. = device n-2 */
+static uint64_t out_opened, out_stall_since;
+static unsigned out_played, out_peak, out_reported;
+static int output_try(int candidate, const WAVEFORMATEX *f) {
+    const char *want = getenv("HOS_AUDIO_DEVICE");
+    unsigned device;
+    if (candidate == 0) {
+        if (!want || !*want) return 0;
+        device = (unsigned)atoi(want);
+    } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
+    const MMRESULT result = waveOutOpen(&wout, device, f, 0, 0, CALLBACK_NULL);
+    if (result != MMSYSERR_NOERROR) {
+        output_error("waveOutOpen", result);
+        wout = NULL;
+        return 0;
+    }
+    au_opened(wout);
+    char name[64];
+    if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
+    else au_device_name(device, name, sizeof name);
+    hos_log("audio: output on %s (%u devices)", name, au_device_count());
+    return 1;
+}
 static void output_open(void) {
+    static int dump_done;
     const char *d = getenv("HOS_AUDIO_DUMP");
-    if (d && (dump = fopen(d, "wb")) != NULL) {
+    if (!dump_done && d && (dump = fopen(d, "wb")) != NULL) {
         static const uint8_t z[44];
         fwrite(z, 1, 44, dump);
     }
+    dump_done = 1;
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
-#ifndef _WIN32
-    const SdlDyn *s = hos_sdl();
-    if (!s || s->InitSubSystem(SDLD_INIT_AUDIO)) {
-        hos_log("audio: no output device%s%s", s ? ": " : "", s ? s->GetError() : "");
-        return;
-    }
-    SdlAudioSpec want = {0}, have;
-    want.freq = RATE, want.format = SDLD_AUDIO_S16LSB, want.channels = 2, want.samples = FRAME * 2;
-    sdl_dev = s->OpenAudioDevice(NULL, 0, &want, &have, 0);   /* (no changes allowed: SDL converts to the device) */
-    if (!sdl_dev) {
-        hos_log("audio: no output device: %s", s->GetError());
-        return;
-    }
-    s->PauseAudioDevice(sdl_dev, 0);
-    sdl_out = s;
-    return;
-#else
     WAVEFORMATEX f = {0};
     f.wFormatTag = WAVE_FORMAT_PCM;
     f.nChannels = 2;
@@ -614,17 +649,35 @@ static void output_open(void) {
     f.wBitsPerSample = 16;
     f.nBlockAlign = 4;
     f.nAvgBytesPerSec = RATE * 4;
-    if (waveOutOpen(&wout, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
-        hos_log("audio: no output device");
-        wout = NULL;
-        return;
+    const int candidates = 2 + (int)au_device_count();
+    for (int tried = 0; tried < candidates && !wout; tried++) {
+        const int c = out_next;
+        out_next = (out_next + 1) % candidates;
+        output_try(c, &f);
     }
+    if (!wout) return;
     for (int i = 0; i < NBLOCKS; i++) {
+        memset(&hdr[i], 0, sizeof hdr[i]);
         hdr[i].lpData = (LPSTR)blocks[i];
         hdr[i].dwBufferLength = sizeof blocks[i];
         hdr[i].dwFlags = WHDR_DONE;
     }
-#endif
+    fill_block = fill_frames = 0;
+    out_opened = au_ms();
+    out_stall_since = 0;
+    out_played = out_peak = out_reported = 0;
+}
+static void output_reopen(void) {
+    static int reopens;
+    out_stall_since = 0;
+    if (++reopens > 6) return;
+    hos_log("audio: the output device took no sound for 1.5 s: trying the next one");
+    waveOutReset(wout);
+    for (int i = 0; i < NBLOCKS; i++)
+        if (hdr[i].dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, &hdr[i], sizeof hdr[i]);
+    waveOutClose(wout);
+    wout = NULL;
+    output_open();
 }
 static void dump_finish(void) {
     if (!dump) return;
@@ -658,26 +711,52 @@ static void output_frame(const int16_t *pcm) {
             fseek(dump, at, SEEK_SET);
         }
     }
-#ifndef _WIN32
-    if (!sdl_out) return;
-    if (sdl_out->GetQueuedAudioSize(sdl_dev) >= NBLOCKS * 2 * FRAME * 4) return;   /* the device is behind: dropped */
-    sdl_out->QueueAudio(sdl_dev, pcm, FRAME * 4);
-#else
     if (!wout) return;
+    for (int i = 0; i < FRAME * 2; i++) {
+        const unsigned a = (unsigned)(pcm[i] < 0 ? -pcm[i] : pcm[i]);
+        if (a > out_peak) out_peak = a;
+    }
+    if (!out_reported && au_ms() - out_opened > 10000) {
+        out_reported = 1;
+        hos_log("audio: %u blocks played in the first 10 s, loudest sample %u of 32767%s", out_played, out_peak,
+                out_played == 0 ? " (the device takes nothing)" : out_peak == 0 ? " (the game sent silence)" : "");
+    }
     WAVEHDR *h = &hdr[fill_block];
     if (fill_frames == 0) {
-        if (!(h->dwFlags & WHDR_DONE)) return;   /* the device is behind: this frame is dropped */
-        if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(wout, h, sizeof *h);
+        if (!(h->dwFlags & WHDR_DONE)) {   /* the device is behind: this frame is dropped */
+            const uint64_t now = au_ms();
+            if (!out_stall_since) out_stall_since = now;
+            else if (now - out_stall_since > 1500) output_reopen();
+            return;
+        }
+        out_stall_since = 0;
+        if (h->dwFlags & WHDR_PREPARED) {
+            const MMRESULT result = waveOutUnprepareHeader(wout, h, sizeof *h);
+            if (result != MMSYSERR_NOERROR) {
+                output_error("waveOutUnprepareHeader", result);
+                return;   /* the driver has not released the header: do not change its samples or flags */
+            }
+        }
     }
     memcpy(blocks[fill_block] + fill_frames * FRAME * 2, pcm, FRAME * 4);
     if (++fill_frames == 2) {
         h->dwFlags = 0;
-        waveOutPrepareHeader(wout, h, sizeof *h);
-        waveOutWrite(wout, h, sizeof *h);
+        const char *operation = "waveOutPrepareHeader";
+        MMRESULT result = waveOutPrepareHeader(wout, h, sizeof *h);
+        if (result == MMSYSERR_NOERROR) {
+            operation = "waveOutWrite";
+            result = waveOutWrite(wout, h, sizeof *h);
+            if (result == MMSYSERR_NOERROR) out_played++;
+        }
+        if (result != MMSYSERR_NOERROR) {
+            output_error(operation, result);
+            /* A failed submission has no completion to set DONE. Reuse only a host-owned block; a prepared header
+               is unprepared on its next turn. Without this, returning to this slot drops every later audio frame. */
+            if (!(h->dwFlags & WHDR_INQUEUE)) h->dwFlags |= WHDR_DONE;
+        }
         fill_frames = 0;
         fill_block = (fill_block + 1) % NBLOCKS;
     }
-#endif
 }
 
 /* ---- parameter updates ------------------------------------------------------------------------------------------
@@ -799,6 +878,17 @@ static void commit(void) {   /* (with the lock held) */
     ncmds = 0;
 }
 
+/* The mixer's next deadline. `next` was the one just woken for; one frame is `period` later, on that same grid.
+   A wake more than 100 ms late used to move the grid to now. The frames in between were never mixed, so each stall
+   left the sound that far behind the picture: a little on the intro, and by seconds after a longer one. The loop
+   mixes the owed frames instead (a late wake returns at once until the grid has caught up). A pause of more than a
+   few seconds still jumps, so a suspend is not mixed out all at once. */
+static int64_t audio_mix_deadline(int64_t now, int64_t next, int64_t period) {
+    next += period;
+    if (now - next > 3000000000LL) next = now + period;
+    return next;
+}
+
 /* ---- the renderer thread --------------------------------------------------------------------------------------- */
 static uint64_t renderer_event;
 static volatile int renderer_running;
@@ -813,8 +903,7 @@ static DWORD WINAPI renderer_main(void *p) {
     static int16_t pcm[FRAME * 2];
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
-        next += period;
-        if (hos_now_ns() - next > 100000000) next = hos_now_ns() + period;   /* (fell far behind: catch up) */
+        next = audio_mix_deadline(hos_now_ns(), next, period);
         if (!renderer_running) continue;
         au_lock();
         if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
@@ -1191,6 +1280,20 @@ HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadF
         submit(&k);
         static int logged;
         if (k.i1 && logged++ < 8) AUT("audio: voice biquad %d: b %.3f %.3f %.3f a %.3f %.3f", f, k.b[0], k.b[1], k.b[2], k.a[0], k.a[1]);
+    }
+    au_unlock();
+}
+/* TBiquadFilterParameter<float>: bool @0, numerator[3] @4, additive-feedback denominator[2] @16. */
+HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquadFilterParameterIfEE) {
+    au_lock();
+    Voice *v = voice_of(ARG(0));
+    const int f = (int)ARG(1);
+    if (v && f >= 0 && f < 2 && ARG(2)) {
+        const uint64_t p = ARG(2);
+        Cmd k = {.op = OP_VOICE_BIQUAD, .idx = (int)(v - voices), .i0 = f, .i1 = *(uint8_t *)GP(p) != 0};
+        memcpy(k.b, GP(p + 4), sizeof k.b);
+        memcpy(k.a, GP(p + 16), sizeof k.a);
+        submit(&k);
     }
     au_unlock();
 }

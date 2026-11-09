@@ -1,0 +1,44 @@
+"""The Insert menu's GPU device row (gpu/vk/gpu_choice.h and its use in vk_main.cpp's pick_device), no game or GPU
+required.
+
+python -I -B tests/test_gpu_choice.py [--cxx g++]
+"""
+import argparse
+import subprocess
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cxx", default="g++")
+    args = parser.parse_args()
+    vk = ROOT / "gpu" / "vk"
+    main_src = (vk / "vk_main.cpp").read_text(encoding="utf-8")
+    pick = main_src[main_src.index("bool pick_device() {"):]
+    pick = pick[:pick.index("\n}\n")]
+    for need, why in (("menu_init()", "the saved choice is read before it is used"),
+                      ("menu_set_gpu_count((int)valid_gpus.size())", "the row offers only the usable GPUs"),
+                      ("p.apiVersion >= VK_API_VERSION_1_3", "only Vulkan 1.3 GPUs are listed"),
+                      ('getenv("RX_VK_DEVICE")', "RX_VK_DEVICE wins over the row"),
+                      ("gpu_choice::menu_device(opts.gpu_device, (int)valid_gpus.size())", "the row's choice is taken")):
+        if need not in pick:
+            raise SystemExit("pick_device: %s is missing (%s)" % (need, why))
+    if pick.index("menu_init()") > pick.index("gpu_choice::menu_device"):
+        raise SystemExit("pick_device reads the GPU row before menu_init")
+    if pick.index('getenv("RX_VK_DEVICE")') > pick.index("gpu_choice::menu_device"):
+        raise SystemExit("pick_device takes the GPU row before RX_VK_DEVICE")
+    menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
+    if "r.value != &opts.gpu_device" not in menu:
+        raise SystemExit("vk_menu.cpp: changing the GPU row resets the quality preset (and its VRAM budget) to Custom")
+    with tempfile.TemporaryDirectory(prefix="gpu-choice-") as tmp:
+        exe = Path(tmp) / "gpu-choice"
+        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror",
+                        str(ROOT / "tests" / "test_gpu_choice.cpp"), "-o", str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+
+
+if __name__ == "__main__":
+    main()

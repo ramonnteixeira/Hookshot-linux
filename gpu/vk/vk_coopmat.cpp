@@ -68,7 +68,9 @@ std::vector<uint32_t> build_shader(const std::function<void(TestShader&)>& body)
     m.AddCapability(spv::Capability::Float16);
     m.AddCapability(spv::Capability::CooperativeMatrixKHR);
     m.AddExtension("SPV_KHR_cooperative_matrix");
-    m.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    m.AddCapability(spv::Capability::VulkanMemoryModel);
+    m.AddExtension("SPV_KHR_vulkan_memory_model");
+    m.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::VulkanKHR);
     const Id void_t = m.TypeVoid();
     s.u32 = m.TypeUInt(32);
     const Id uvec3 = m.TypeVector(s.u32, 3);
@@ -341,6 +343,12 @@ void software_multiplies(const char* why) {
 } // namespace
 
 void coopmat_init() {
+    // (amd-fix) NaN guard on float colour outputs (mma_layout.h frag_nan_guard), on every card since v2.0.6 as NX2navi's patch 0027
+    // has it: the neon plants were reported on NVIDIA cards too, and one NaN texel spreads through bloom and blur
+    Shader::Backend::SPIRV::frag_nan_guard = !std::getenv("RX_VK_NO_NAN_GUARD");
+    if (Shader::Backend::SPIRV::frag_nan_guard) logf("vk: colour outputs NaN-guarded");
+    Shader::Backend::SPIRV::position_invariant = dev.props.vendorID != 0x10DE && !std::getenv("RX_VK_NO_INVARIANT");
+    if (Shader::Backend::SPIRV::position_invariant) logf("vk: positions invariant (not an NVIDIA card)");
     // (hookshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
     // (emit_spirv_warp.cpp, from Lichii): the lowering still gives HMMA_nx2 (dev.native_mma)
     if (const char* sw = std::getenv("RX_VK_MMA_SOFTWARE"); sw && std::atoi(sw)) {

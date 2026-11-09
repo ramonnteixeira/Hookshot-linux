@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -22,6 +23,13 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+
+namespace Shader::Optimization {   // (EvilOOT: collect_shader_info_pass.cpp, declared here so no header changes)
+extern thread_local u32 g_nvn2_compute_ssbo_base;
+extern thread_local u32 g_nvn2_compute_ssbo_count;
+extern thread_local u32 g_nvn2_compute_layout_end;
+extern thread_local bool g_nvn2_miss_log_this;
+}
 
 namespace Shader::Maxwell {
 namespace {
@@ -95,21 +103,35 @@ void AddGlobalTables(IR::Program& program) {
     // binding names. The back end's table at c0+0x880 holds the regions those pointers reach (vk_bank.cpp pointer_table).
     // Few entries: each is searched at every read, and a program has ~150 of them (with 16, the driver took so long over each
     // pipeline that a scene never finished loading)
-    if ((program.stage == Stage::Task || program.stage == Stage::Mesh) && program.info.uses_global_memory) {
-        program.info.storage_buffers_descriptors.push_back({
-            .cbuf_index = 0U,
-            .cbuf_offset = 0x880U,
-            .count = 3U,
-            .is_written = false,
-        });
-    }
-    for (u32 i = 0; i < program.info.num_global_tables; ++i) {
+    // (EvilOOT) and compute programs, whose layout ends before the table (collect_shader_info_pass.cpp
+    // g_nvn2_compute_layout_end): OoT's culling passes reach their object lists through pointers in their records
+    const bool compute_table{program.stage == Stage::Compute && Optimization::g_nvn2_compute_layout_end != 0 &&
+                             Optimization::g_nvn2_compute_layout_end <= 0x880U};
+    // (EvilOOT) the program's own tables first: the search takes the first buffer that holds an address, and the pointer
+    // table's regions are whole pools for compute (vk_bank.cpp pointer_table), bound GPU-only. Searched before the precise
+    // entries, the culling setup's count writes went through the pool's binding and the launches never saw them.
+    // (hookshot, as Lichii #421) none past MAX_SSBOS: the list is a static_vector, and one more threw bad_alloc
+    const auto room{[&] { return program.info.storage_buffers_descriptors.size() < Info::MAX_SSBOS; }};
+    for (u32 i = 0; i < program.info.num_global_tables && room(); ++i) {
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = program.info.global_tables[i].first,
             .cbuf_offset = program.info.global_tables[i].second,
             .count = Info::kGlobalTableSize,
             .is_written = program.info.stores_global_memory,
         });
+    }
+    if ((program.stage == Stage::Task || program.stage == Stage::Mesh || compute_table) && program.info.uses_global_memory &&
+        room()) {
+        program.info.storage_buffers_descriptors.push_back({
+            .cbuf_index = 0U,
+            .cbuf_offset = 0x880U,
+            .count = 3U,
+            .is_written = compute_table && program.info.stores_global_memory,
+        });
+        // (EvilOOT) the global memory functions read the table's words from c0 in SPIR-V, not in the IR the bound size
+        // comes from: c0 must reach past it, or those words read 0
+        u32& used{program.info.constant_buffer_used_sizes[0]};
+        used = std::max<u32>(used, 0x880U + 16U * 3U);
     }
 }
 
@@ -119,7 +141,10 @@ void AddNVNStorageBuffers(IR::Program& program) {
     }
     const u32 driver_cbuf{0};
     const u32 descriptor_size{0x10};
-    const u32 num_buffers{16};
+    // (EvilOOT) NVN2 compute: as many slots as its table has (past them c0 holds texture handles, not buffers)
+    const u32 num_buffers{program.stage == Stage::Compute && Optimization::g_nvn2_compute_ssbo_base
+                              ? std::min<u32>(Optimization::g_nvn2_compute_ssbo_count, 16)
+                              : 16};
     const u32 base{[&] {
         switch (program.stage) {
         case Stage::VertexA:
@@ -137,8 +162,8 @@ void AddNVNStorageBuffers(IR::Program& program) {
             return 0x410u;
         case Stage::Fragment:
             return 0x510u;
-        case Stage::Compute:
-            return 0x310u;
+        case Stage::Compute:   // (EvilOOT: NVN2's, collect_shader_info_pass.cpp g_nvn2_compute_ssbo_base)
+            return Optimization::g_nvn2_compute_ssbo_base ? Optimization::g_nvn2_compute_ssbo_base : 0x310u;
         }
         throw InvalidArgument("Invalid stage {}", program.stage);
     }()};
@@ -153,12 +178,41 @@ void AddNVNStorageBuffers(IR::Program& program) {
             it->is_written |= program.info.stores_global_memory;
             continue;
         }
+        if (descs.size() >= Info::MAX_SSBOS) {
+            break;   // (hookshot, as Lichii #421: no bad_alloc; the slots left out read 0)
+        }
         descs.push_back({
             .cbuf_index = driver_cbuf,
             .cbuf_offset = offset,
             .count = 1,
             .is_written = program.info.stores_global_memory,
         });
+        // (EvilOOT) the fallbacks read this slot's address and size from c0 in SPIR-V: c0 bound at least that far
+        u32& used{program.info.constant_buffer_used_sizes[driver_cbuf]};
+        used = std::max<u32>(used, offset + descriptor_size);
+    }
+    // (EvilOOT) RX_VK_MISS_LOG=1, diagnostics: a buffer at c0+0xff0 (no real slot) that the global memory functions record
+    // the addresses no binding held in (spirv_emit_context.cpp), bound by the back end per program (vk_draw.cpp)
+    static const bool miss_log{std::getenv("RX_VK_MISS_LOG") != nullptr && std::atoi(std::getenv("RX_VK_MISS_LOG")) != 0};
+    // (compute only: the driver crashed compiling a mesh program with it; and only the program vk_shader.cpp names when
+    // RX_VK_MISS_LOG_PROG is set: Optimization::g_nvn2_miss_log_this)
+    if (miss_log && (program.stage == Stage::Compute || program.stage == Stage::Mesh || program.stage == Stage::Task) &&
+        Optimization::g_nvn2_miss_log_this && descs.size() < Info::MAX_SSBOS) {
+        descs.push_back({
+            .cbuf_index = driver_cbuf,
+            .cbuf_offset = 0xff0U,
+            .count = 1,
+            .is_written = true,
+        });
+    }
+    // (EvilOOT) the global memory fallbacks search every single storage buffer (spirv_emit_context.cpp
+    // DefineGlobalMemoryFunctions): a program that stores through them may write any of them
+    if (program.info.stores_global_memory) {
+        for (auto& desc : descs) {
+            if (desc.count == 1) {
+                desc.is_written = true;
+            }
+        }
     }
 }
 
@@ -434,7 +488,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         const u32 threads{program.stage == Stage::Task ? init & 0x3f : (shader_b >> 20) & 0x3f};
         program.workgroup_size = {(std::max)(threads, 1U), 1, 1};
         if (program.stage == Stage::Mesh) {
-            if (program.mesh.topology != 4 && program.mesh.topology != 1) {   // (GL's numbers: 1 lines, 4 triangles)
+            if (program.mesh.topology != 4 && program.mesh.topology != 1 &&
+                program.mesh.topology != 0) {   // (GL's numbers: 0 points, 1 lines, 4 triangles)
                 throw NotImplementedException("Mesh output topology {} (SET_MESH_SHADER_A {:#010x})",
                                               program.mesh.topology, shader_a);
             }
@@ -468,7 +523,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
 
-    Optimization::GlobalMemoryToStorageBufferPass(program, normalized_host_info);
+    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
     Optimization::GeometryCompactionPass(program, normalized_host_info);
     Optimization::TexturePass(env, program, normalized_host_info);
 

@@ -8,14 +8,10 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
 #include <direct.h>
-#else
-#include <sys/stat.h>   // (linux port)
-#define _mkdir(d) mkdir((d), 0755)
-#endif
 
 #include "vk_dump.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 namespace {

@@ -4,15 +4,13 @@
 
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#define VKX_WIN32_SURFACE(X) X(vkCreateWin32SurfaceKHR)
+#else
+#define VKX_WIN32_SURFACE(X)   /* (linux: SDL makes the surface, host/posix/display_sdl.c) */
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#define VKX_WIN32_SURFACE(X) X(vkCreateWin32SurfaceKHR)
-#else
-/* (linux port) libvulkan.so.1; the surface comes from the window's own code (host/display_sdl.c, SDL2) */
-#include "win32_compat.h"
-#define VKX_WIN32_SURFACE(X)
-#endif
 #include <vulkan/vulkan.h>
 
 #define VKX_GLOBAL(X)                                                                                                 \
@@ -90,6 +88,7 @@
     X(vkGetImageMemoryRequirements)                                                                                   \
     X(vkGetImageSparseMemoryRequirements)                                                                             \
     X(vkGetMemoryHostPointerPropertiesEXT)                                                                            \
+    X(vkGetMemoryFdPropertiesKHR)                                                                                     \
     X(vkGetBufferDeviceAddress)
 
 // shaders, pipelines, descriptors, draws
@@ -155,8 +154,9 @@
     X(vkCmdSetAlphaToCoverageEnableEXT) X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) \
     X(vkCmdBindVertexBuffers2) X(vkCmdWriteTimestamp2) X(vkCreateQueryPool) X(vkDestroyQueryPool) \
     X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) \
+    X(vkResetQueryPool) \
     X(vkCmdSetDepthClipEnableEXT) X(vkCmdSetLogicOpEXT) X(vkCmdClearAttachments) X(vkCmdSetDepthBoundsTestEnable) \
-    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT)
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkCmdWriteBufferMarkerAMD)
 
 namespace vkx {
 #define VKX_DECLARE(f) extern PFN_##f f;

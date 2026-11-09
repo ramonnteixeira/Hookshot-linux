@@ -1,0 +1,11 @@
+# The actions the workflows use are pinned by commit (the version in a comment beside each): Dependabot proposes the
+# newer ones once a week, pin and comment together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']

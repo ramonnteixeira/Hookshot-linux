@@ -38,6 +38,15 @@ constexpr u32 GUEST_PAGES_PUSH_OFFSET = sizeof(RescalingLayout) + sizeof(RenderA
 // (hookshot) a task program's first workgroup: NVN draws tasks [first, first + count), Vulkan from 0. The address of the draw's first
 // (a u32, 16 bytes per draw of an indirect draw, read at + DrawIndex * 16) is pushed here
 constexpr u32 MESH_FIRST_PUSH_OFFSET = GUEST_PAGES_PUSH_OFFSET + 8;
+// (hookshot) the mesh shader fallback's buffers, after it: the task payloads and the vertex records (u64 device addresses).
+// Paths without the fallback never push them.
+constexpr u32 MESH_FALLBACK_PUSH_OFFSET = MESH_FIRST_PUSH_OFFSET + 8;
+constexpr u32 MESH_FALLBACK_PAYLOAD_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET;
+constexpr u32 MESH_FALLBACK_RECORDS_PUSH_OFFSET = MESH_FALLBACK_PUSH_OFFSET + 8;
+constexpr u32 MESH_FALLBACK_PUSH_END = MESH_FALLBACK_PUSH_OFFSET + 16;
+// (hookshot) the fallback's mesh workgroups a draw can run: each gets a record slot and a payload. The vertex stage draws
+// this many slots and holds the ones no mesh workgroup wrote to outside the clip volume.
+constexpr u32 MESH_FALLBACK_CAPACITY = 1024;
 
 [[nodiscard]] std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings);
 [[nodiscard]] inline std::vector<u32> EmitSPIRV(const Profile& profile, IR::Program& program) {

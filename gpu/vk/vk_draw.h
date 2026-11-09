@@ -1,11 +1,25 @@
 // Draws and dispatches (vk_draw.cpp).
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "vk_internal.h"
+#include "vk_state.h"
 
 namespace mkwvk {
 /// Something other than the draw path pushed or bound descriptors in the recording (its next push is whole)
 void descriptors_disturbed();
+
+/// A graphics pipeline as hookshot_pipelines.bin keeps it (the precompile's notes): what built it
+struct PipeNote {
+    uint64_t key, prog, variant;
+    uint32_t topo, n, samples, depth_format, has_depth;
+    uint32_t color_format[8];
+    NvnState s;
+};
+/// (vk_predict.cpp) The pipelines the notes predict for the kept graphics program variants no note names (key 0: not made yet)
+std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::unique_ptr<PipeNote>>& notes, size_t* programs);
 }
 
 #include <functional>
@@ -32,6 +46,8 @@ struct DrawArgs {
 
 /// A recording starts (its slot's descriptor pool and upload stream are reset); value: the timeline value it signals
 void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value);
+/// The recording's stream still holds [at, at + n) in the mapping at base (a reset starts used over)
+bool stream_holds(const uint8_t* base, uint64_t at, uint64_t n);
 /// The open render pass ends (before transfers, clears, barriers and the recording's end)
 void end_pass(VkCommandBuffer cmd);
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d);
@@ -53,6 +69,9 @@ void draw_records_log(uint64_t frame_lo, uint64_t frame_hi);
 void pass_traces_log(uint64_t frame_lo, uint64_t frame_hi);   // (RX_VK_PASS_TRACE=1)
 /// Changes with every uniform update the stream makes (vk_replay.cpp): descriptors bound before may be stale
 uint64_t ub_generation();
+/// A background thread (shader translation, pipeline builds) reads guest memory from the captures only, never the stream's
+/// uniform updates: that list is the replay's, which grows and is pruned while such a thread runs
+void ub_thread_off();
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
 

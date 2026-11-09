@@ -1,0 +1,40 @@
+name: Fork checks
+
+# (fork) The fork's own test on its linux-port branch; the official workflows run on main and dev only. docs/fork.md.
+on:
+  push:
+    branches: [linux-port]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setjmp:
+    name: setjmp / longjmp on Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install clang and the tools' Python modules
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld python3-lz4 python3-numpy python3-capstone python3-zstandard
+          pip install --user --break-system-packages unicorn
+      - name: Run the test
+        run: |
+          python3 -I - "$RUNNER_TEMP" <<'EOF'
+          import os, sys
+          sys.path.insert(0, "nx2"); sys.path.insert(0, "third_party/a64-kit/lift")
+          import rtgen, a64_rtgen, a64_lift
+          out = sys.argv[1]
+          rtgen.write(os.path.join(out, "rt64"))
+          os.makedirs(os.path.join(out, "gen"), exist_ok=True)
+          a64_rtgen.write(os.path.join(out, "gen"))
+          open(os.path.join(out, "gen", "a64_fpx.h"), "w").write(a64_lift.fpx_header(set()))
+          EOF
+          clang -O2 -D_GNU_SOURCE -march=x86-64-v3 -Ihost -Ihost/posix -I"$RUNNER_TEMP/rt64" -I"$RUNNER_TEMP/gen" \
+            -Wno-everything tests/setjmp_test.c -o "$RUNNER_TEMP/sjt"
+          "$RUNNER_TEMP/sjt"

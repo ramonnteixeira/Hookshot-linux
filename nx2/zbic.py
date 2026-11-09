@@ -23,9 +23,8 @@ def _build():
     if os.path.exists(DLL):
         return
     srcs = [os.path.join(SRC, "zstd.c"), os.path.join(SRC, "zbic_api.c")]
-    cmd = [toolchain.need(toolchain.find("clang")), *toolchain.native_target(), *toolchain.native_link(),
-           "-O2", "-shared", "-DZSTD_ZBIC_SUPPORT=1", "-I", SRC, "-o", DLL, *srcs] + \
-          ([] if os.name == "nt" else ["-fPIC"])   # (linux port: a shared object)
+    cmd = [toolchain.need(toolchain.find("clang", host=True)), *toolchain.native_target(host=True), *toolchain.native_link(host=True),
+           "-O2", "-shared", *([] if os.name == "nt" else ["-fPIC"]), "-DZSTD_ZBIC_SUPPORT=1", "-I", SRC, "-o", DLL, *srcs]
     print("building", os.path.basename(DLL), file=sys.stderr)
     subprocess.run(cmd, check=True)
 

@@ -16,5 +16,14 @@ inline std::array<uint32_t, 8> mma_order_a{0, 1, 2, 3, 4, 5, 6, 7};
 inline std::array<uint32_t, 4> mma_order_b{0, 1, 2, 3};
 inline std::array<uint32_t, 4> mma_order_c{0, 1, 2, 3};
 inline bool mma_software = false;   // (HMMA_nx2 in software: emit_spirv_warp.cpp, RX_VK_MMA_SOFTWARE=1)
+// (amd-fix) float colour outputs carry no NaN or infinity to their target (EmitSetFragColor): one NaN texel spreads
+// through bloom/blur/downsample averages into glowing blocks (OoT's flowers on AMD, Hookshot issue 606). On for every
+// card but NVIDIA (vk_coopmat.cpp coopmat_init); RX_VK_NO_NAN_GUARD=1 turns it off. Idea from NX2navi patch 0027.
+inline bool frag_nan_guard = false;
+// (amd-fix) gl_Position decorated Invariant (vertex and mesh outputs): the game draws a depth pre-pass, then the colour
+// pass again with depth EQUAL; Maxwell computes the same position in both, AMD's compiler may not without Invariant, and
+// the colour pass is then rejected in spots: holes showing the bright sky, blown up by bloom (the glowing flowers).
+// On for every card but NVIDIA (vk_coopmat.cpp); RX_VK_NO_INVARIANT=1 off. From NX2navi patch 0007.
+inline bool position_invariant = false;
 
 } // namespace Shader::Backend::SPIRV

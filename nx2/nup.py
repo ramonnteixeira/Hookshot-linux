@@ -1,6 +1,7 @@
 """Read a .nup package (a decrypted Switch 2 dump: titles, each with an exefs/ and a romfs/ tree) and extract it.
 
     python -I nx2/nup.py <file.nup>                      list the titles and their trees
+    python -I nx2/nup.py <file.nup> --verify            read-only hashes/extents and expected game .zs headers
     python -I nx2/nup.py <file.nup> --extract <dir> [--title <n|version>] [--only exefs|romfs]
 
 The layout (worked out from the file; little-endian):
@@ -9,8 +10,8 @@ The layout (worked out from the file; little-endian):
     0x0b0  titles, 0x40 each: u64 title id, u32 root dir, u32 exefs dir, u32 romfs dir, u32 version, ...,
            u64 offset + u64 size of the title's metadata blob at +0x20
     then   dirs, 24 bytes each: u32 name offset, u32 name length, u32 first child, u32 children, u64 0
-    then   files, 80 bytes each: u32 name offset, u32 name length, u64 size, u64 data offset, u64 size again,
-           32-byte hash, 16 bytes 0
+    then   files, 80 bytes each: u32 name offset, u32 name length, u64 size, u64 data offset, u64 stored size,
+           32-byte hash, u8 codec (0 raw, 1 zstd), u8 flags, u16 reserved, 12 bytes reserved
     then   the child list, u32 each: a node index; below the dir count a dir, else (index - dirs) a file
     then   the name strings (not 0-terminated)
 The data of a file is stored as is at its data offset, or, in .nup files from newer dumpers, as a zstd frame whose content is the
@@ -18,6 +19,7 @@ file: its size field is then the size of the file, not of the frame (seen on rtl
 A file that is itself zstd in the game (the romfs .zs files) is not one of those: its frame's content is larger than the file.
 """
 import argparse
+import hashlib
 import os
 import shutil
 import stat
@@ -44,13 +46,32 @@ def frame_content_size(head):
 
 
 class Nup:
-    def __init__(self, path):
+    def __init__(self, path, *, strict=False):
         self.path = path
         self.f = open(path, "rb")
         h = self.f.read(0x80)
+        if strict and len(h) != 0x80:
+            self.f.close()
+            raise ValueError("truncated NUP header")
         if h[:4] != b"NUP\x01":
             raise SystemExit("%s: not a NUP package (magic %r)" % (path, h[:4]))
         self.file_size = struct.unpack_from("<Q", h, 0x40)[0]
+        self.toc_offset, self.toc_size = struct.unpack_from("<QQ", h, 8)
+        self.toc_sha256 = h[24:56]
+        self.blob_offset = struct.unpack_from("<Q", h, 0x38)[0]
+        # (a package that ends early (a download or copy that did not finish) failed 30 minutes in as "short read in the
+        # package": said now, with the sizes)
+        have = os.fstat(self.f.fileno()).st_size
+        if strict:
+            try:
+                self._verify_toc()   # check metadata hash/bounds before parsing records
+            except (ValueError, OSError, struct.error):
+                self.f.close()
+                raise
+            self.f.seek(0x80)
+        if self.file_size and have < self.file_size:
+            raise SystemExit("the .nup file is incomplete: it is %d MB, its header says %d MB. Download or copy it again "
+                             "(wait for the download to finish) and check that the drive had room" % (have >> 20, self.file_size >> 20))
         t = self.f.read(0x30)
         if t[:4] != b"TOC\x01":
             raise SystemExit("%s: no TOC at 0x80" % path)
@@ -70,11 +91,105 @@ class Nup:
             self.titles.append(dict(index=i, id=tid, root=root, exefs=exefs, romfs=romfs, version=ver))
         self.dirs = [struct.unpack_from("<4I", meta, dirs_at + 24 * i) for i in range(nd)]
         self.files = []
+        self.file_details = []   # hash, codec flags and reserved bytes; keep files tuples compatible
         for i in range(nf):
             no, nl, size, off, size2 = struct.unpack_from("<IIQQQ", meta, files_at + 80 * i)
-            self.files.append((no, nl, size, off, size2))
+            self.files.append((no, nl, size, off, size2, meta[files_at + 80 * i + 64]))
+            at = files_at + 80 * i
+            self.file_details.append((meta[at + 32:at + 64], meta[at + 65], meta[at + 66:at + 80]))
         nk = (strings_at - kids_at) // 4
         self.kids = struct.unpack_from("<%dI" % nk, meta, kids_at)
+        if strict:
+            try:
+                self._verify_tree()
+            except ValueError:
+                self.f.close()
+                raise
+
+    def _verify_toc(self):
+        """Check parsed metadata bounds and the complete TOC hash."""
+        self.f.seek(0)
+        h = self.f.read(0x80)
+        physical = os.fstat(self.f.fileno()).st_size
+        if (len(h) != 0x80 or self.file_size != physical or self.toc_offset != 0x80 or
+                self.toc_size < 0x30 or self.toc_offset + self.toc_size > self.blob_offset or
+                self.blob_offset > physical or self.blob_offset % 16):
+            raise ValueError("invalid declared file/TOC/blob bounds")
+        self.f.seek(self.toc_offset)
+        t = self.f.read(0x30)
+        if len(t) != 0x30 or t[:4] != b"TOC\x01":
+            raise ValueError("invalid TOC header")
+        nt, nd, nf, soff, ssz = struct.unpack_from("<IQQQQ", t, 4)
+        tables_end = 0x30 + 64 * nt + 24 * nd + 80 * nf
+        if (not nt or tables_end > soff or (soff - tables_end) % 4 or
+                soff + ssz > self.toc_size):
+            raise ValueError("parsed title/directory/file/child/string tables exceed declared TOC")
+        self.f.seek(self.toc_offset)
+        left, digest = self.toc_size, hashlib.sha256()
+        while left:
+            block = self.f.read(min(left, 8 << 20))
+            if not block:
+                raise ValueError("truncated TOC")
+            left -= len(block)
+            digest.update(block)
+        if digest.digest() != self.toc_sha256:
+            raise ValueError("TOC SHA-256 mismatch")
+
+    def _verify_tree(self):
+        """Validate ranges/reachability and reject cycles without recursive traversal."""
+        for no, nl, first, count in self.dirs:
+            if no + nl > len(self.strings) or first + count > len(self.kids):
+                raise ValueError("directory name/child range outside table")
+            self.name(no, nl)
+        for record in self.files:
+            if record[0] + record[1] > len(self.strings):
+                raise ValueError("file name outside string table")
+            self.name(record[0], record[1])
+        if any(child >= self.nd + self.nf for child in self.kids):
+            raise ValueError("child index outside directory/file tables")
+        reached_dirs, reached_files = set(), set()
+        for title in self.titles:
+            if title["root"] >= self.nd or any(title[part] != 0xffffffff and title[part] >= self.nd
+                                                 for part in ("exefs", "romfs")):
+                raise ValueError("title %d has an invalid directory index" % title["index"])
+            seen, active, pending = set(), set(), [(title["root"], False)]
+            while pending:
+                directory, leaving = pending.pop()
+                if leaving:
+                    active.remove(directory)
+                    seen.add(directory)
+                    continue
+                if directory in active:
+                    raise ValueError("directory cycle in title %d" % title["index"])
+                if directory in seen:
+                    continue
+                active.add(directory)
+                pending.append((directory, True))
+                _, _, first, count = self.dirs[directory]
+                for child in self.kids[first:first + count]:
+                    if child < self.nd:
+                        pending.append((child, False))
+                    else:
+                        reached_files.add(child - self.nd)
+            if any(title[part] != 0xffffffff and title[part] not in seen for part in ("exefs", "romfs")):
+                raise ValueError("title subtree is not reachable from its root")
+            reached_dirs.update(seen)
+        if len(reached_dirs) != self.nd or len(reached_files) != self.nf:
+            raise ValueError("orphan directory/file records are not reachable from title roots")
+
+    def verify_walk(self, directory):
+        """Already validated nodes, iteratively (including data/ and deep trees)."""
+        pending = [(directory, "")]
+        while pending:
+            node, prefix = pending.pop()
+            if node < self.nd:
+                no, nl, first, count = self.dirs[node]
+                for child in reversed(self.kids[first:first + count]):
+                    path = prefix + self.name(*self.dirs[child][:2]) + "/" if child < self.nd else prefix
+                    pending.append((child, path))
+            else:
+                record = self.files[node - self.nd]
+                yield prefix + self.name(record[0], record[1]), record
 
     def name(self, off, n):
         return self.strings[off:off + n].decode("utf-8")
@@ -103,6 +218,8 @@ class Nup:
         """A file the package keeps compressed. A frame that states no size is tried: it is the file when it unpacks to the listed size.
         A .zs file is zstd in the game too, and three of them happen to hold exactly as much as they take: that one is packed only if
         what it holds is zstd again"""
+        if r[5] == 1:   # The TOC explicitly marks outer compression, even for a non-Zstd .zs payload.
+            return True
         self.f.seek(r[3])
         head = self.f.read(18)
         if head[:4] != ZSTD:
@@ -128,13 +245,15 @@ class Nup:
             return False
         return got == r[2]
 
-    def copy_to(self, r, g, name=""):
+    def copy_to(self, r, g, name="", *, packed=None):
         """The file, as itself, into the open file g"""
-        packed = self.is_packed(r, name)
+        exact = packed is not None
+        if packed is None:
+            packed = self.is_packed(r, name)
         self.f.seek(r[3])
         left = r[2]
         if packed:
-            left += 1 << 16   # (a frame of something that does not compress is a little larger than what it holds)
+            left = r[4] if r[5] == 1 else left + (1 << 16)   # explicit extents must not read the next member
             import zstandard
             d = zstandard.ZstdDecompressor().decompressobj()
             got = 0
@@ -149,13 +268,18 @@ class Nup:
                     break
                 g.write(out)
                 got += len(out)
+            if exact and (left or d.unused_data):
+                raise SystemExit("a compressed extent has trailing bytes")
+            if r[5] == 1 and not d.eof:
+                raise SystemExit("a compressed file ends before its frame completes")
             if got != r[2]:
                 raise SystemExit("a compressed file came out as %d bytes, %d expected" % (got, r[2]))
             return
         while left:
             b = self.f.read(min(left, 8 << 20))
             if not b:
-                raise SystemExit("short read in the package")
+                raise SystemExit("the .nup file ends early (short read at %d of %d MB): it is incomplete. Download or copy it again"
+                                 % (self.f.tell() >> 20, os.fstat(self.f.fileno()).st_size >> 20))
             g.write(b)
             left -= len(b)
 
@@ -164,6 +288,80 @@ class Nup:
         b = io.BytesIO()
         self.copy_to(r, b)
         return b.getvalue() if n is None else b.getvalue()[:n]
+
+
+class VerifySink:
+    """A streamed digest and just enough prefix for the inner game-file header."""
+    def __init__(self):
+        self.size, self.prefix, self.hash = 0, b"", hashlib.sha256()
+
+    def write(self, data):
+        self.size += len(data)
+        self.hash.update(data)
+        self.prefix += data[:max(0, 18 - len(self.prefix))]
+
+
+def verify(nup, titles=None, only=None):
+    """Read-only container checks plus expected .zs headers, not full inner decoding/authenticity."""
+    import zstandard
+    bad = checked = 0
+    cache = {}
+    physical = os.fstat(nup.f.fileno()).st_size
+    try:
+        nup._verify_toc()
+        nup._verify_tree()
+    except (ValueError, OSError, struct.error) as error:
+        print("BAD package: %s" % error)
+        return dict(checked_records=0, decoded_extents=0, bad=1)
+    indices = {id(record): i for i, record in enumerate(nup.files)}
+    for title in nup.titles if titles is None else titles:
+        parts = [(only, title[only])] if only else [("", title["root"])]
+        for part, directory in parts:
+            if directory == 0xffffffff:
+                continue
+            for name, record in nup.verify_walk(directory):
+                checked += 1
+                expected, flags, reserved = nup.file_details[indices[id(record)]]
+                size, off, stored, codec = record[2:]
+                reasons = []
+                if codec not in (0, 1) or flags or any(reserved):
+                    reasons.append("unsupported codec/flags/reserved bytes")
+                if (size == 0 and (off or stored or codec)) or (size and (
+                        not stored or off < nup.blob_offset or off % 16 or off > physical or stored > physical - off)):
+                    reasons.append("invalid extent bounds")
+                if codec == 0 and stored != size:
+                    reasons.append("raw extent length differs from member length")
+                key = (off, stored, codec, size)
+                if not reasons:
+                    if key not in cache:
+                        sink, error = VerifySink(), None
+                        try:
+                            # Honor the explicit codec; leave legacy extraction heuristics unchanged.
+                            nup.copy_to(record, sink, name, packed=codec == 1)
+                        except (OSError, SystemExit, zstandard.ZstdError) as failure:
+                            error = str(failure)
+                        cache[key] = (sink.size, sink.hash.digest(), sink.prefix, error)
+                    count, digest, prefix, error = cache[key]
+                    if error:
+                        reasons.append("member decode failed: " + error)
+                    if count != size:
+                        reasons.append("decoded length differs from member length")
+                    if digest != expected:
+                        reasons.append("member SHA-256 mismatch")
+                    if name.endswith(".zs"):
+                        try:
+                            if prefix[:4] != ZSTD:
+                                raise ValueError("missing magic")
+                            zstandard.get_frame_parameters(prefix)
+                        except (ValueError, zstandard.ZstdError):
+                            reasons.append(".zs member lacks the expected game Zstd header")
+                if reasons:
+                    bad += 1
+                    print("BAD title %d %016x v%d %s/%s: %s" % (
+                        title["index"], title["id"], title["version"], part, name, "; ".join(reasons)))
+    print("verified %d records, %d unique extents: %d bad; game .zs headers only (not inner decode/authenticity)" % (
+        checked, len(cache), bad))
+    return dict(checked_records=checked, decoded_extents=len(cache), bad=bad)
 
 
 def pick_title(nup, want):
@@ -258,10 +456,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("nup")
     ap.add_argument("--extract", metavar="DIR")
-    ap.add_argument("--title", help="index, version or title id (default: the newest)")
+    ap.add_argument("--verify", action="store_true", help="read-only hashes/extents and expected game .zs headers; all titles unless --title")
+    ap.add_argument("--title", help="index, version or title id (extract default: newest; verify default: all)")
     ap.add_argument("--only", choices=("exefs", "romfs"))
     a = ap.parse_args()
-    nup = Nup(a.nup)
+    if a.verify and a.extract:
+        ap.error("--verify does not extract; run extraction separately")
+    try:
+        nup = Nup(a.nup, strict=a.verify)
+    except (OSError, ValueError, struct.error, IndexError, SystemExit) as error:
+        if not a.verify:
+            raise
+        print("BAD package: %s" % error)
+        return 1
+    if a.verify:
+        try:
+            titles = None if a.title is None else [pick_title(nup, a.title)]
+            return 1 if verify(nup, titles, a.only)["bad"] else 0
+        finally:
+            nup.f.close()
     print("%s: %.2f GB, %d titles, %d dirs, %d files" % (os.path.basename(a.nup), nup.file_size / 1e9,
                                                           len(nup.titles), nup.nd, nup.nf))
     for t in nup.titles:

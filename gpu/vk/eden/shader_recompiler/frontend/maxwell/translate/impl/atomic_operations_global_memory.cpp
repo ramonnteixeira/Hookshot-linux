@@ -201,6 +201,23 @@ void TranslatorVisitor::ATOM(u64 insn) {
     GlobalAtomic(*this, atom.dest_reg, atom.operand_reg, offset, atom.size, atom.op, true);
 }
 
+// (hookshot) ATOM.E.CAS Rd, [Ra + offset], Rb, Rb+1: Rb the comparator, Rb+1 the value. 32 bits only (size 0).
+void TranslatorVisitor::ATOM_cas(u64 insn) {
+    union {
+        u64 raw;
+        BitField<0, 8, IR::Reg> dest_reg;
+        BitField<20, 8, IR::Reg> operand_reg;
+        BitField<49, 3, u64> size;
+    } const cas{insn};
+    if (cas.size != 0) {
+        throw NotImplementedException("ATOM.CAS size {}", cas.size.Value());
+    }
+    const IR::U64 offset{AtomOffset(*this, insn)};
+    const IR::U32 comparator{X(cas.operand_reg)};
+    const IR::U32 value{cas.operand_reg == IR::Reg::RZ ? ir.Imm32(0) : X(cas.operand_reg + 1)};
+    X(cas.dest_reg, ir.GlobalAtomicCompareExchange(offset, comparator, value));
+}
+
 void TranslatorVisitor::RED(u64 insn) {
     union {
         u64 raw;

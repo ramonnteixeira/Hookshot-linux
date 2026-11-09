@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Game-free Windows SEH check of the actual precompile compute arm.
+
+Extracts production code; fake Vulkan never loads a GPU driver. The thread and
+join below are fixture scaffolding, not the production scheduler/handover.
+"""
+import argparse
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+
+
+def block(text, marker):
+    start = text.index(marker)
+    end = text.index('{', start) + 1
+    depth = 1
+    while depth:
+        depth += (text[end] == '{') - (text[end] == '}')
+        end += 1
+    return text[start:end]
+
+
+HEAD = r'''
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+using VkResult=int; using VkPipeline=uintptr_t; using VkPipelineCache=uintptr_t;
+constexpr VkResult VK_SUCCESS=0; constexpr uintptr_t VK_NULL_HANDLE=0;
+constexpr int VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO=10;
+constexpr int VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO=11;
+constexpr int VK_SHADER_STAGE_COMPUTE_BIT=12;
+struct VkComputePipelineCreateInfo {
+ int sType; struct {int sType=0,stage=0;uintptr_t module=0;const char*pName=nullptr;} stage;
+ uintptr_t layout=0;
+};
+struct {uintptr_t device=0x1234;}dev;
+VkPipelineCache pcache=0x5678;
+struct Program {struct Stage{uintptr_t module;};std::vector<Stage>stages{{0x2468}};unsigned workgroup[3]{32,1,1};uintptr_t layout=0x1357;VkPipeline compute_pipeline=0xbeef;};
+struct Pre {std::mutex mu;bool abandoned=false;};
+int mode=0,calls=0,destroys=0; bool completed=false;
+#define CHECK(c) do {if(!(c)){std::fprintf(stderr,"CHECK failed line %d: %s\n",__LINE__,#c);std::exit(7);}}while(0)
+const VkComputePipelineCreateInfo* expected_ci=nullptr; VkPipeline* expected_out=nullptr;
+void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&stage,unsigned x){CHECK(x==32);CHECK(stage.stage==12);}
+VkResult vkCreateComputePipelines(uintptr_t device,VkPipelineCache cache,unsigned count,const VkComputePipelineCreateInfo*ci,const void*allocator,VkPipeline*out){
+ CHECK(device==dev.device&&cache==pcache&&count==1&&allocator==nullptr&&out);
+ CHECK(ci&&ci->sType==10&&ci->stage.sType==11&&ci->stage.stage==12&&ci->stage.module==0x2468&&ci->layout==0x1357);
+ CHECK(ci->stage.pName&&std::string(ci->stage.pName)=="main");
+ if(expected_ci)CHECK(ci==expected_ci); if(expected_out)CHECK(out==expected_out);
+ ++calls;
+ if(mode==1)RaiseException(EXCEPTION_ACCESS_VIOLATION,0,0,nullptr);
+ if(mode==2){*out=VK_NULL_HANDLE;return -4;}
+ *out=0xcafe;return VK_SUCCESS;
+}
+void vkDestroyPipeline(uintptr_t device,VkPipeline made,const void*allocator){CHECK(device==dev.device&&made==0xcafe&&allocator==nullptr);++destroys;}
+'''
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source',type=Path,default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--cxx',default='clang++')
+    parser.add_argument('--linker',type=Path)
+    parser.add_argument('--expect-fault',action='store_true',help='unfixed source must exit with injected access violation')
+    args=parser.parse_args()
+    if os.name != "nt":
+        raise SystemExit("Windows structured exceptions required")
+    source=(args.source/'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
+    wrapper=block(source,'__declspec(noinline) VkResult guarded_compute(')
+    precompile=block(source,'void precompile_run(')
+    arm=block(precompile,'if (i < computes.size()) {')
+    # ci/made identities are checked at the boundary as well as inside the API spy.
+    armed=arm.replace('VkPipeline made = VK_NULL_HANDLE;', 'VkPipeline made = VK_NULL_HANDLE; expected_ci=&ci; expected_out=&made;')
+    assert armed != arm
+    cpp=HEAD+wrapper+'\nvoid actual_arm(Program&program,Pre*pre){std::vector<Program*>computes{&program};size_t i=0;'+armed+'\ncompleted=true;}\n'+r'''
+int main(int argc,char**argv){
+ SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX);
+ CHECK(argc==2);int which=std::atoi(argv[1]);Program program;Pre pre;
+ if(which==4){
+  mode=1;VkComputePipelineCreateInfo ci{10};ci.stage={11,12,0x2468,"main"};ci.layout=0x1357;VkPipeline out=0;
+  expected_ci=&ci;expected_out=&out;
+  CHECK(guarded_compute(pcache,&ci,&out)==-77);CHECK(calls==1&&out==0);return 0;
+ }
+ mode=which==1?1:which==2?2:0;pre.abandoned=which==3;
+ std::thread worker([&]{actual_arm(program,&pre);});worker.join();
+ CHECK(completed&&calls==1);
+ if(which==0)CHECK(program.compute_pipeline==0xcafe&&destroys==0);
+ if(which==1||which==2)CHECK(program.compute_pipeline==0&&destroys==0);
+ if(which==3)CHECK(program.compute_pipeline==0xbeef&&destroys==1);
+ return 0;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix='precompile-seh-') as tmp:
+        path=Path(tmp); unit=path/'fixture.cpp';exe=path/'fixture.exe';unit.write_text(cpp,encoding='utf-8')
+        cmd=[args.cxx,'--target=x86_64-pc-windows-msvc','-std=c++20',str(unit),'-o',str(exe),'-fuse-ld=lld']
+        if args.linker:cmd+=['-B'+str(args.linker.parent)]
+        subprocess.run(cmd,check=True,timeout=60)
+        for case in [0,1,2,3,4]:
+            result=subprocess.run([str(exe),str(case)],timeout=10)
+            code=result.returncode & 0xffffffff
+            expected=0xc0000005 if args.expect_fault and case==1 else 0
+            if code!=expected:raise SystemExit(f'case {case}: exit {code:#x}, expected {expected:#x}')
+            print(f'case {case}: exit {code:#x} PASS',flush=True)
+    print('PASS: extracted wrapper/compute arm; modeled thread join only')
+
+
+if __name__=='__main__':
+    main()
+
+

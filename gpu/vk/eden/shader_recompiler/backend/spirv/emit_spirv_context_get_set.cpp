@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
+#include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -307,6 +308,14 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
     const u32 element{static_cast<u32>(attr) % 4};
     if (IR::IsGeneric(attr)) {
         const u32 index{IR::GenericAttributeIndex(attr)};
+        if (ctx.stage == Stage::Fragment && ctx.runtime_info.point_coord_generics.test(index)) {
+            // (hookshot) the point sprite's coordinate in place of the generic (RuntimeInfo::point_coord_generics)
+            if (element < 2) {
+                return ctx.OpLoad(ctx.F32[1],
+                                  ctx.OpAccessChain(ctx.input_f32, ctx.point_coord, ctx.Const(element)));
+            }
+            return ctx.Const(element == 3 ? 1.0f : 0.0f);
+        }
         const auto& generic{ctx.input_generics.at(index)};
         if (!ValidId(generic.id)) {
             // Attribute is disabled or varying component is not written
@@ -491,6 +500,10 @@ void EmitSetFragColor(EmitContext& ctx, u32 index, u32 component, Id value) {
     const AttributeType type{ctx.runtime_info.color_output_types[index]};
     if (type == AttributeType::Float) {
         const Id pointer{ctx.OpAccessChain(ctx.output_f32, ctx.frag_color.at(index), component_id)};
+        if (frag_nan_guard) {   // (amd-fix, mma_layout.h) NaN -> 0, the rest clamped to +-1e30
+            const Id clamped{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, ctx.Const(-1e30f)), ctx.Const(1e30f))};
+            value = ctx.OpSelect(ctx.F32[1], ctx.OpIsNan(ctx.U1, value), ctx.Const(0.0f), clamped);
+        }
         ctx.OpStore(pointer, value);
     } else if (type == AttributeType::UnsignedInt) {
         const Id pointer{ctx.OpAccessChain(ctx.output_u32, ctx.frag_color.at(index), component_id)};

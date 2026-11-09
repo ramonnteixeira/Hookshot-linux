@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   /* (older Windows SDKs lack it: Windows 10 1803 and later take it) */
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -485,7 +485,12 @@ void hos_thread_start(HosThread *t) {
 void hos_thread_join(HosThread *t) {
     if (!t->handle) return;
     const int away = hos_vcore_away();
-    WaitForSingleObject(t->handle, INFINITE);
+    /* (EvilOOT, 11-07: a freeze after Load, one thread joining another for good: a join of over 10 s says who joins whom, once) */
+    if (WaitForSingleObject(t->handle, 10000) == WAIT_TIMEOUT) {
+        HosThread *self = hos_self();
+        hos_log("thread %s: joining %s for 10 s", self ? hos_thread_name(self) : "?", t->name);
+        WaitForSingleObject(t->handle, INFINITE);
+    }
     if (away) hos_vcore_back();
 }
 
@@ -577,6 +582,13 @@ void hos_thread_pin(void *h, const char *name) {
                                   THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST};
     if ((p = match_name_spec(prios, nprios, name)) && p->value >= -2 && p->value <= 2)
         SetThreadPriority(h, levels[p->value + 2]);
+    else if (strstr(name, "OptimizeChange") && !getenv("HOS_OCB_NORMAL")) {
+        /* (OoT's OptimizeChangeBank (guest priority 27, a background thread) walks every placed object of the
+           area by name, again and again (Kokiri: ~344 names, ~250k lookups a second). On the console it only gets the
+           time nothing more important wants; at the host's normal priority it took the renderer's and the driver's
+           cores and the frame waited (Kokiri, RX 6600 + 5600G: 17-20 fps; lowest: 21-28). HOS_OCB_NORMAL=1: as before) */
+        SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
+    }
 }
 
 /* ---- time ------------------------------------------------------------------------------------------------ */

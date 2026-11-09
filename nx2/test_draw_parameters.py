@@ -22,7 +22,8 @@ def main():
 namespace IR { enum Attribute { InstanceId, VertexId, BaseInstance, BaseVertex, DrawID }; }
 std::vector<uint32_t> program(unsigned mask,bool supported) {
     using namespace Sirit;
-    Module ctx{0x00010600};ctx.AddCapability(spv::Capability::Shader);
+    // (EmitContext's own member the block reads: a task program's DrawIndex; off here, as for every vertex program)
+    struct Ctx : Module { using Module::Module; bool wants_mesh_first{}; } ctx{0x00010600};ctx.AddCapability(spv::Capability::Shader);
     ctx.SetMemoryModel(spv::AddressingModel::Logical,spv::MemoryModel::GLSL450);
     struct { bool support_vertex_instance_id; } profile{supported};
     struct { std::array<bool,5> loads; } info{};

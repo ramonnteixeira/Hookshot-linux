@@ -105,7 +105,9 @@ class NupCacheTests(unittest.TestCase):
                                                      side_effect=AssertionError("Unexpected file launch"))),
             ]
             stack.enter_context(mock.patch.object(sys, "argv", argv))
-            stack.enter_context(mock.patch.object(make_game, "check_toolchain"))
+            stack.enter_context(mock.patch.object(make_game, "check_windows_sdk"))
+            stack.enter_context(mock.patch.object(make_game, "stop_stray_compilers"))   # (Windows: powershell, taskkill)
+            stack.enter_context(mock.patch.object(make_game, "drop_stale_objects"))
             stack.enter_context(mock.patch.object(make_game, "no_throttle"))
             stack.enter_context(mock.patch("ctypes.WinDLL", create=True))
             stack.enter_context(mock.patch.object(make_game, "run", side_effect=run))

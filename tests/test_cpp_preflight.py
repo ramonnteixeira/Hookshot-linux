@@ -1,8 +1,8 @@
-"""Windows-only, game-free C++ library preflight checks.
+"""Game-free C++ library preflight checks (the Visual Studio route of nx2/make_game.py).
 
-Run in a Visual Studio developer command prompt:
+In a Visual Studio developer command prompt, or on Linux with any C++20 compiler:
     python -I -B tests/test_cpp_preflight.py --cxx clang++
-Repeat --cxx-arg for target flags. Run these checks inside a configured developer environment.
+Repeat --cxx-arg for target flags. The end-to-end case takes the Visual Studio route on any host.
 The partial-library fixture is authored here; it is not a copy of an old vendor library.
 """
 import argparse
@@ -11,6 +11,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,17 +31,12 @@ OLD_FORMAT_PROBE = '\n'.join((
     'std::string t(int v) { return std::vformat("{}", std::make_format_args(v)); }', ""))
 
 
-
-# (linux port) the update advice is the platform's: Visual Studio on Windows, clang and its C++ library elsewhere
-UPDATE_HINT = "Visual Studio 2022" if os.name == "nt" else "clang 17"
-TOO_OLD = "@@error Your Visual Studio is too old" if os.name == "nt" else "@@error This clang's C++ library is too old"
-
 class Toolchain:
     def __init__(self, compiler, flags=()):
         self.compiler, self.flags = compiler, list(flags)
 
     def find(self, name):
-        if name != "clang++":
+        if name not in ("clang++", "clang"):   # (check_mingw asks for clang since PR 434)
             raise AssertionError("Unexpected tool requested: " + name)
         return self.compiler
 
@@ -54,7 +50,7 @@ class Toolchain:
 class CppPreflightTests(unittest.TestCase):
     def setUp(self):
         if COMPILER is None:
-            self.fail("Run this Windows check as a script with --cxx and a configured developer environment")
+            self.fail("Run this check as a script with --cxx (and, on Windows, a configured developer environment)")
         self.temporary = tempfile.TemporaryDirectory(prefix="hookshot-cpp-preflight-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
@@ -100,7 +96,7 @@ class CppPreflightTests(unittest.TestCase):
             make_game.check_cpp_library(toolchain)
         self.assertEqual(stopped.exception.code, 1)
         self.assertIn("ranges", output.getvalue())
-        self.assertIn(UPDATE_HINT, output.getvalue())
+        self.assertIn("Visual Studio 2022", output.getvalue())
 
     def test_failed_compiler_keeps_details_and_update_instructions(self):
         result = subprocess.CompletedProcess([], 1, "authored compiler output\n", "error: authored ranges failure\n")
@@ -112,8 +108,8 @@ class CppPreflightTests(unittest.TestCase):
         compile_run.assert_called_once()
         self.assertIn("authored compiler output", output.getvalue())
         self.assertIn("authored ranges failure", output.getvalue())
-        self.assertIn(TOO_OLD, output.getvalue())
-        self.assertIn(UPDATE_HINT, output.getvalue())
+        self.assertIn("@@error Your Visual Studio is too old", output.getvalue())
+        self.assertIn("Visual Studio 2022", output.getvalue())
 
     def test_library_failure_stops_check_and_build_before_reading_input(self):
         for check_only in (True, False):
@@ -139,6 +135,10 @@ class CppPreflightTests(unittest.TestCase):
                 run = stack.enter_context(mock.patch.object(make_game, "run",
                     side_effect=AssertionError("Input reading or translation reached")))
                 stack.enter_context(mock.patch.object(make_game, "no_throttle"))
+                # (the Visual Studio route on any host: on Linux check_windows_sdk asks for the system's clang, and
+                # with llvm-mingw beside the builder it takes that one; this case is about Visual Studio's library)
+                stack.enter_context(mock.patch.object(make_game, "LINUX", False))
+                stack.enter_context(mock.patch.object(make_game, "bundled_mingw", return_value=""))
                 stack.enter_context(mock.patch("ctypes.WinDLL", create=True))
                 argv = ["make_game.py", "--nup", str(self.root / "missing-input.nup"),
                         "--out", str(self.root / "output"), "--work", str(self.root / "work")]
@@ -149,7 +149,7 @@ class CppPreflightTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as stopped:
                     make_game.main()
                 self.assertEqual(stopped.exception.code, 1)
-                self.assertIn(UPDATE_HINT, output.getvalue())
+                self.assertIn("Visual Studio 2022", output.getvalue())
                 compiler.assert_called_once()
                 run.assert_not_called()
                 for launch in launches:
@@ -162,5 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--cxx", required=True, help="C++ compiler with its normal library/SDK environment")
     parser.add_argument("--cxx-arg", action="append", default=[], help="extra compiler flag (repeatable)")
     args, remaining = parser.parse_known_args()
-    COMPILER, COMPILER_FLAGS = args.cxx, args.cxx_arg
+    # (a full path: the build's compiler check takes what toolchain.find() returns only when it is a file, so a bare
+    # "g++" read as no compiler at all)
+    COMPILER, COMPILER_FLAGS = shutil.which(args.cxx) or args.cxx, args.cxx_arg
     unittest.main(argv=[sys.argv[0], *remaining])

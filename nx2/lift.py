@@ -155,6 +155,11 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
+    if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
+        import oot_wide
+        oot_wide.install(L, img)
+        import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
+        oot_occlusion.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     total = coverage(L, img, img_dir)
@@ -171,9 +176,11 @@ def main():
         if not a.no_polls:
             poll.install()
         gen = os.path.join(out_dir, "gen")
-        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone)
+        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
+                             counters=[] if a.no_polls else [poll.stats])
         import oot_patches
-        oot_patches.apply(gen)
+        main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
+        oot_patches.apply(gen, protect_hearts=a.standalone and main_build == oot_patches.LIFE_BUILD_ID)
         a64_rtgen.write(gen)
         if a.standalone:
             start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)

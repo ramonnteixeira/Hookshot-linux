@@ -7,7 +7,7 @@ instruction form the game uses matches Unicorn bit for bit, and the native build
 layer (`hos/`) is only the image builder and a loader so far: nothing boots yet.
 
 **Licensing:** the instruction translator is suyu's (GPL-2.0-or-later, `lift/suyu/`), so this kit and everything
-built with it is GPL. The other kits are untouched by it. See [third_party/NOTICE.md](../third_party/NOTICE.md).
+built with it are GPL. The other kits are untouched by it. See [third_party/NOTICE.md](../third_party/NOTICE.md).
 
 ## Pipeline
 

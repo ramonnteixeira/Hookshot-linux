@@ -26,6 +26,8 @@ bool last_dyn_valid=false;int topology_calls=0,restart_calls=0;
 uint32_t actual_topology=999,actual_restart=999;
 void vkCmdSetPrimitiveTopology(int,uint32_t v){topology_calls++;actual_topology=v;}
 void vkCmdSetPrimitiveRestartEnable(int,uint32_t v){restart_calls++;actual_restart=v;}
+enum {FC_DYN_CALLS};
+#define FINE_X(c, n) ((void)0)
 '''+macro+'''
 void run(bool mesh,uint32_t topo,uint32_t restart) {
     int cmd=1;DynState d{};struct {uint32_t restart;}s{restart};

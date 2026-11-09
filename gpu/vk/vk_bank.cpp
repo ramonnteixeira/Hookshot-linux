@@ -12,12 +12,15 @@
 
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"   // (linux port: <windows.h> on Windows)
+#include <windows.h>
 
 #include "vk_internal.h"
 #include "vk_state.h"
 
 namespace mkwvk {
+// (hookshot) the seed's compute programs (vk_shader.cpp seed_program) have no bound program to read their layout from. Translated
+// with Maxwell's table instead, one kept the right key and the wrong storage buffers, and play would have used it as it was
+thread_local const uint8_t* seed_cs_control = nullptr;
 namespace {
 
 struct TexReg {
@@ -34,6 +37,7 @@ std::vector<TexReg> tex_regs;
 std::vector<SampReg> samp_regs;
 std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
+std::atomic<uint64_t> samp_gen{1};  // (bumped when a sampler registration's contents change: sampler_for's cache, vk_draw.cpp)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
@@ -51,7 +55,14 @@ struct CsLayout {
     uint32_t img_at() const { return tex_at() + 8 * tex; }
     uint32_t end() const { return img_at() + 8 * img; }
 };
+CsLayout cs_layout_of(const uint8_t* c) {   // (c: the control section from +0x58)
+    CsLayout l;
+    l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
+    l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+    return l;
+}
 CsLayout cs_layout(const NvnState& s) {
+    if (seed_cs_control) return cs_layout_of(seed_cs_control + 0x58);
     static std::mutex mu;
     static std::unordered_map<uint64_t, CsLayout> by_serial;
     std::lock_guard lk(mu);
@@ -65,8 +76,7 @@ CsLayout cs_layout(const NvnState& s) {
         host->gpu_read(s.prog.sd[i].control, &magic, 4);
         host->gpu_read(s.prog.sd[i].control + 0x56, &st, 2);
         if (magic != 0x98761234 || st != 5) continue;
-        l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
-        l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+        l = cs_layout_of(c);
         static const bool log_cs = getenv("RX_VK_LOG_CS") != nullptr;   // (hookshot) the control bytes 0xb0..0xbf
         if (log_cs) {
             char hex[700];
@@ -85,6 +95,27 @@ CsLayout cs_layout(const NvnState& s) {
 }
 
 } // namespace
+
+/// (EvilOOT) where the bound compute program's storage buffer table is in c0, and how many slots it has (vk_shader.cpp gives
+/// them to the translator: Eden's Maxwell layout had it at 0x310, NVN2 compute right after the uniform buffer table)
+uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end) {
+    const CsLayout l = cs_layout(s);
+    if (count) *count = l.ssbo;
+    if (layout_end) *layout_end = l.end();
+    return l.ssbo_at();
+}
+
+/// (hookshot, #940) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
+/// the address word of an entry of the uniform or storage buffer table its control section lays out. Nothing is bound before the
+/// game, so the storage buffer pass's port (EDEN_NX2_GM_LEGACY=0), which binds an access to a pointer only when that pointer is
+/// mapped (Env::IsCbufStorageBufferPointer), found none and left every access to the run-time search, under the key play then used
+/// the program by. Answered from the layout, the prepared program comes out as play translates it
+bool seed_cs_buffer_word(uint32_t offset) {
+    if (!seed_cs_control || (offset & 15)) return false;
+    const CsLayout l = cs_layout_of(seed_cs_control + 0x58);
+    const auto in = [offset](uint32_t at, uint32_t n) { return offset >= at && offset < at + 16 * std::min(n, 16u); };
+    return in(l.ubo_at(), l.ubo) || in(l.ssbo_at(), l.ssbo);
+}
 
 const void* descriptor_ok(const void* p, size_t n) {
     if (!p) return nullptr;
@@ -161,8 +192,14 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     const nvn_samp_par* p = &par;
     std::lock_guard lk(reg_mu);
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
+    // (sampler_for's cache goes stale only when a registration's contents change, not at each rewrite of the same)
+    const bool same = samp_regs[id].ok && !std::memcmp(&samp_regs[id].p, p, sizeof *p);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    if (!same) samp_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+uint64_t sampler_registrations_generation() {
+    return samp_gen.load(std::memory_order_acquire);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);
@@ -230,6 +267,24 @@ const PointerEntry* pointer_table(const NvnState& s, int stage) {
     }
     std::sort(found, found + n);
     uint32_t regions = 0;
+    if (stage == 5 || stage == 6 || stage == 7) {   // (EvilOOT) compute, task and mesh: whole pools
+        // (mesh programs too: once OoT's foliage draws were given work they read their instances through the same kind of
+        // pointers, and with 1 MB regions every primitive was clipped away: positions read as 0)
+        // OoT's culling passes follow pointers found in their records into lists that hold more pointers, spread over one
+        // ~100 MB pool: regions of 1 MB past the first pointers missed them, the reads gave 0 and every object was culled.
+        // The pools that hold the pointers are bound whole (read by the shader's search; GPU-only, never copied back, as
+        // vk_draw.cpp binds the table), as far as a storage buffer reaches.
+        const uint64_t most = std::min<uint64_t>(dev.props.limits.maxStorageBufferRange, 0xFFFFFF00ull) & ~0xFFull;
+        for (uint32_t i = 0; i < n && regions < kPointerEntries; i++) {
+            const uint64_t lo = gpu_pool_start(found[i]), hi = gpu_pool_end(found[i]);
+            if (!hi || hi <= lo) continue;
+            bool have = false;
+            for (uint32_t k = 0; k < regions; k++) have |= e[k].addr == lo;
+            if (have) continue;
+            e[regions++] = {lo, std::min<uint64_t>(hi - lo, most)};
+        }
+        return e;
+    }
     for (uint32_t i = 0; i < n && regions < kPointerEntries; regions++) {
         const uint64_t first = found[i], end = gpu_pool_end(first);
         if (!end) {
@@ -273,6 +328,16 @@ void driver_bank_fill(const NvnState& s, int bank, int stage, uint8_t* d, uint32
         for (uint32_t i = 0; i < std::min(l.ssbo, 16u); i++) entry(l.ssbo_at() + 16 * i, s.ssbo[5][i]);
         for (uint32_t i = 0; i < l.tex && l.tex_at() + 8 * i < n; i++) put(l.tex_at() + 8 * i, (uint32_t)s.tex[5][std::min(i, 127u)]);
         for (uint32_t i = 0; i < l.img && l.img_at() + 8 * i < n; i++) put(l.img_at() + 8 * i, (uint32_t)s.img[5][std::min(i, 31u)]);
+        // (EvilOOT) compute programs read through pointers kept in their small storage buffers too (OoT's culling passes:
+        // their object lists, reached through the setup pass's records): the same table as task and mesh programs get, at
+        // 0x880, past the layout (translate_program.cpp AddGlobalTables gives it to compute programs whose layout ends before)
+        if (l.end() <= kPointerTable && n > kPointerTable) {
+            const PointerEntry* e = pointer_table(s, 5);
+            for (uint32_t i = 0; i < kPointerEntries; i++) {
+                const uint32_t off = kPointerTable + 16 * i;
+                put(off, (uint32_t)e[i].addr), put(off + 4, (uint32_t)(e[i].addr >> 32)), put(off + 8, (uint32_t)e[i].size);
+            }
+        }
         return;
     }
     static constexpr uint32_t kSsboTable[kNvnStages] = {0x110, 0x510, 0x410, 0x210, 0x310, 0, 0x670, 0x770};
@@ -324,6 +389,13 @@ uint32_t driver_bank_word(const NvnState& s, int bank, int stage, uint32_t offse
             return (offset - l.ssbo_at()) / 16 < 16 ? entry(s.ssbo[5][(offset - l.ssbo_at()) / 16], (offset - l.ssbo_at()) % 16) : 0;
         if (offset < l.img_at()) return (offset & 7) ? 0 : lo(s.tex[5][std::min<uint32_t>((offset - l.tex_at()) / 8, 127)]);
         if (offset < l.end()) return (offset & 7) ? 0 : lo(s.img[5][std::min<uint32_t>((offset - l.img_at()) / 8, 31)]);
+        // (EvilOOT) compute's pointer table, as task and mesh programs' (translate_program.cpp AddGlobalTables): past the
+        // layout's end only
+        if (l.end() <= kPointerTable && offset >= kPointerTable && offset < kPointerTable + 16 * kPointerEntries) {
+            const PointerEntry& e = pointer_table(s, 5)[(offset - kPointerTable) / 16];
+            const uint32_t in = (offset - kPointerTable) % 16;
+            return in == 0 ? lo(e.addr) : in == 4 ? hi(e.addr) : in == 8 ? (uint32_t)e.size : 0;
+        }
         return 0;
     }
     // (the storage buffer tables: 0x110 + 0x100 a hardware stage: vertex 0x110, tessellation control 0x210 and

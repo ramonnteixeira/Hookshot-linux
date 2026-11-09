@@ -18,8 +18,8 @@ def build(force=False):
     stamp = OUT + ".sha1"
     if not force and os.path.exists(OUT) and os.path.exists(stamp) and open(stamp).read() == key:
         return OUT
-    cmd = [toolchain.need(toolchain.find("clang++")), "-std=c++20", "-O2", "-shared", "-o", OUT, SRC[0],
-           "-Wno-everything"] + toolchain.native_target() + toolchain.native_link()
+    cmd = [toolchain.need(toolchain.find("clang++", host=True)), "-std=c++20", "-O2", "-shared", "-o", OUT, SRC[0],
+           "-Wno-everything"] + toolchain.native_target(host=True) + toolchain.native_link(host=True)
     if os.name != "nt":
         cmd += ["-fPIC"]
     print("building", os.path.basename(OUT))

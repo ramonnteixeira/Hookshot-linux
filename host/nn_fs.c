@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 
 const char *hos_romfs_dir, *hos_user_dir;
 
@@ -58,7 +58,7 @@ static int host_path(const char *guest, char *out, size_t cap, int *writable) {
         }
     }
     ReleaseSRWLockShared(&mount_lock);
-    for (char *p = out; ok && *p; p++) if (*p == '/') *p = HOS_SEP;
+    for (char *p = out; ok && *p; p++) if (*p == '/') *p = '\\';
     return ok;
 }
 
@@ -70,8 +70,8 @@ static const char *gstr(uint64_t a) { return a ? (const char *)GP(a) : ""; }
 static void make_dirs(const char *path) {   /* every parent of path */
     char tmp[MAX_PATH];
     snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + (tmp[0] == '/' ? 1 : 3); *p; p++)   /* (past the drive, "C:\\", on Windows; past the root on Linux) */
-        if (*p == HOS_SEP) { *p = 0; CreateDirectoryA(tmp, NULL); *p = HOS_SEP; }
+    for (char *p = tmp + 3; *p; p++)
+        if (*p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
 }
 
 /* ---- handles: a FileHandle / DirectoryHandle is one pointer-sized value; ours are table indices + 1 ----------- */
@@ -119,7 +119,7 @@ HLE(_ZN2nn2fs8MountRomEPKc) {
 
 static void user_mount(const char *name, const char *sub) {
     char root[MAX_PATH];
-    snprintf(root, sizeof root, "%s" HOS_SEP_S "%s", hos_user_dir, sub);
+    snprintf(root, sizeof root, "%s\\%s", hos_user_dir, sub);
     make_dirs(root);
     CreateDirectoryA(root, NULL);
     mount(name, root, 1);
@@ -128,21 +128,21 @@ static void user_mount(const char *name, const char *sub) {
 /* nn::fs::IsSaveDataExisting(ApplicationId, account::Uid const&) -> bool */
 HLE(_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE) {
     char root[MAX_PATH];
-    snprintf(root, sizeof root, "%s" HOS_SEP_S "save" HOS_SEP_S "%016llx%016llx", hos_user_dir, (unsigned long long)G64(ARG(1) + 8),
+    snprintf(root, sizeof root, "%s\\save\\%016llx%016llx", hos_user_dir, (unsigned long long)G64(ARG(1) + 8),
              (unsigned long long)G64(ARG(1)));
     RET(GetFileAttributesA(root) != INVALID_FILE_ATTRIBUTES);
 }
 /* MountSaveData(char const*, account::Uid const&) */
 HLE(_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE) {
     char sub[64];
-    snprintf(sub, sizeof sub, "save" HOS_SEP_S "%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
+    snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(1) + 8), (unsigned long long)G64(ARG(1)));
     user_mount(gstr(ARG(0)), sub);
     RET(0);
 }
 /* MountSaveDataReadOnly(char const*, ApplicationId, account::Uid const&) */
 HLE(_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE) {
     char sub[64];
-    snprintf(sub, sizeof sub, "save" HOS_SEP_S "%016llx%016llx", (unsigned long long)G64(ARG(2) + 8), (unsigned long long)G64(ARG(2)));
+    snprintf(sub, sizeof sub, "save\\%016llx%016llx", (unsigned long long)G64(ARG(2) + 8), (unsigned long long)G64(ARG(2)));
     user_mount(gstr(ARG(0)), sub);
     RET(0);
 }
@@ -150,14 +150,14 @@ HLE(_ZN2nn2fs21MountTemporaryStorageEPKc) { user_mount(gstr(ARG(0)), "temp"); RE
 /* MountCacheStorage(char const*, int index) */
 HLE(_ZN2nn2fs17MountCacheStorageEPKci) {
     char sub[32];
-    snprintf(sub, sizeof sub, "cache" HOS_SEP_S "%d", (int)ARG(1));
+    snprintf(sub, sizeof sub, "cache\\%d", (int)ARG(1));
     user_mount(gstr(ARG(0)), sub);
     RET(0);
 }
 /* CreateCacheStorage(int index, long size, long journal) */
 HLE(_ZN2nn2fs18CreateCacheStorageEill) {
     char root[MAX_PATH];
-    snprintf(root, sizeof root, "%s" HOS_SEP_S "cache" HOS_SEP_S "%d" HOS_SEP_S, hos_user_dir, (int)ARG(0));
+    snprintf(root, sizeof root, "%s\\cache\\%d\\", hos_user_dir, (int)ARG(0));
     make_dirs(root);
     RET(0);
 }
@@ -169,7 +169,7 @@ HLE(_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorage
     int n = 0, max = (int)ARG(3);
     for (; cache_list_pos < 16 && n < max; cache_list_pos++) {
         char root[MAX_PATH];
-        snprintf(root, sizeof root, "%s" HOS_SEP_S "cache" HOS_SEP_S "%d", hos_user_dir, cache_list_pos);
+        snprintf(root, sizeof root, "%s\\cache\\%d", hos_user_dir, cache_list_pos);
         if (GetFileAttributesA(root) != INVALID_FILE_ATTRIBUTES) {
             memset(GP(ARG(1) + 0x20 * n), 0, 0x20);
             G32(ARG(1) + 0x20 * n) = (uint32_t)cache_list_pos;
@@ -367,13 +367,13 @@ HLE(_ZN2nn2fs15CreateDirectoryEPKc) {
 static void delete_tree(const char *dir) {
     char pat[MAX_PATH];
     WIN32_FIND_DATAA fd;
-    snprintf(pat, sizeof pat, "%s" HOS_SEP_S "*", dir);
+    snprintf(pat, sizeof pat, "%s\\*", dir);
     HANDLE f = FindFirstFileA(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
         do {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             char sub[MAX_PATH];
-            snprintf(sub, sizeof sub, "%s" HOS_SEP_S "%s", dir, fd.cFileName);
+            snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) delete_tree(sub);
             else DeleteFileA(sub);
         } while (FindNextFileA(f, &fd));
@@ -434,7 +434,7 @@ HLE(_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc) {
     RET(0);
 }
 
-/* ---- directories: DirectoryEntry = { char name[0x301]; pad; u8 type at 0x302; pad; s64 size at 0x308 } ---- */
+/* ---- directories: DirectoryEntry = { char name[0x301]; pad[3]; s8 type at 0x304 (0 directory, 1 file); pad[3]; s64 size at 0x308 } ---- */
 static void add_extra(void *arg, const char *name, int is_dir, uint64_t size) {
     Handle *dh = (Handle *)arg;
     if (!(dh->nextras & 15)) dh->extras = (ExtraEntry *)realloc(dh->extras, sizeof *dh->extras * (size_t)(dh->nextras + 16));
@@ -445,7 +445,7 @@ static void add_extra(void *arg, const char *name, int is_dir, uint64_t size) {
 HLE(_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci) {
     char path[MAX_PATH], pat[MAX_PATH];
     if (!host_path(gstr(ARG(1)), path, sizeof path, NULL)) { RET(R_PATH_NOT_FOUND); return; }
-    snprintf(pat, sizeof pat, "%s" HOS_SEP_S "*", path);
+    snprintf(pat, sizeof pat, "%s\\*", path);
     Handle *dh = (Handle *)calloc(1, sizeof *dh);
     dh->is_dir = (int)ARG(2);   /* mode: 1 directories, 2 files, 3 both */
     snprintf(dh->path, sizeof dh->path, "%s", pat);   /* (for GetDirectoryEntryCount) */
@@ -471,7 +471,7 @@ HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
             uint64_t e = ARG(1) + 0x310 * n;
             memset(GP(e), 0, 0x310);
             snprintf((char *)GP(e), 0x301, "%s", fd->cFileName);
-            *(uint8_t *)GP(e + 0x302) = isdir ? 0 : 1;
+            *(uint8_t *)GP(e + 0x304) = isdir ? 0 : 1;
             G64(e + 0x308) = ((uint64_t)fd->nFileSizeHigh << 32) | fd->nFileSizeLow;
             n++;
         }
@@ -483,7 +483,7 @@ HLE(_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl) {
         uint64_t e = ARG(1) + 0x310 * n;
         memset(GP(e), 0, 0x310);
         snprintf((char *)GP(e), 0x301, "%s", x->name);
-        *(uint8_t *)GP(e + 0x302) = x->is_dir ? 0 : 1;
+        *(uint8_t *)GP(e + 0x304) = x->is_dir ? 0 : 1;
         G64(e + 0x308) = x->size;
         n++;
     }

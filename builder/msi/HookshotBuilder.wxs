@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Windows installer (MSI) around HookshotBuilder.exe (builder/setup/setup.c), for players whose antivirus or SmartScreen
+     treats a bare downloaded exe with more suspicion than an installer package. Per-user (no administrator rights): it puts the
+     setup in %LOCALAPPDATA%\Programs\Hookshot Builder, adds a Start menu entry and starts the setup when it finishes, which installs
+     or updates the builder as HookshotBuilder.exe does. Uninstalling removes the entry and the setup exe.
+     Built with WiX 5 (MS-RL): wix build -arch x64 -d Version=<x.y.z> -d SetupExe=<path> HookshotBuilder.wxs -o HookshotBuilder.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Hookshot Builder" Manufacturer="Hookshot" Version="$(var.Version)" Scope="perUser"
+           UpgradeCode="{6E1A0C2B-6B2F-4C8E-9D35-2F2B8F0D7A41}" Language="1033" Compressed="yes">
+    <SummaryInformation Description="Hookshot Builder installer" />
+    <MajorUpgrade DowngradeErrorMessage="A newer Hookshot Builder installer is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="HookshotIcon" SourceFile="../setup/hookshot.ico" />
+    <Property Id="ARPPRODUCTICON" Value="HookshotIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/NotRexed/Hookshot" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsDir" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Hookshot Builder">
+          <Component Id="SetupExe" Guid="{B4A7E0C9-3D61-4F0A-8C2E-5A9D17E3C6F2}">
+            <File Id="SetupExeFile" Source="$(var.SetupExe)" Name="HookshotBuilder.exe" />
+            <RegistryValue Root="HKCU" Key="Software\Hookshot\Builder" Name="Installer" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+            <RemoveFolder Id="RemoveProgramsDir" Directory="ProgramsDir" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuEntry" Guid="{1F9C2D74-8E35-4B6A-A0D3-7C5E2B91F8A6}">
+        <Shortcut Id="StartMenuShortcut" Name="Hookshot Builder" Description="Build and update Hookshot"
+                  Target="[INSTALLFOLDER]HookshotBuilder.exe" WorkingDirectory="INSTALLFOLDER" Icon="HookshotIcon" />
+        <RegistryValue Root="HKCU" Key="Software\Hookshot\Builder" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Hookshot Builder">
+      <ComponentRef Id="SetupExe" />
+      <ComponentRef Id="StartMenuEntry" />
+    </Feature>
+
+    <!-- (the setup starts once the install is done, as running HookshotBuilder.exe would) -->
+    <CustomAction Id="StartSetup" FileRef="SetupExeFile" ExeCommand="" Return="asyncNoWait" Impersonate="yes" Execute="immediate" />
+    <InstallExecuteSequence>
+      <Custom Action="StartSetup" After="InstallFinalize" Condition="NOT Installed AND NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

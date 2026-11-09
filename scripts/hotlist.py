@@ -38,5 +38,12 @@ for n, k in c.most_common():
         break
     out.append(n)
     acc += k
+# (the game's Zstd decoder: the job loop's f_80115bf0 -> f_80115c80 tree. It runs while areas load and stream, which a play
+# profile seldom samples, so it fell to the cold -O1 chunks. At the hot flags a whole decode takes 16% less time and the
+# code is no bigger; the functions match Unicorn on every register and written page either way. Listed whatever the profile says)
+ZSTD_DECODER = ("f_80115c80 f_80109790 f_80113880 f_80116490 f_801099a0 f_8010b160 f_8010ffc0 f_801102e0 f_80110860 "
+                "f_801117a0 f_80112880 f_80113080 f_801156e0 f_80115880 f_8010ad60 f_834ab610 f_834abda0 f_834ab4a0 "
+                "f_834ac0b0 f_834ac110 f_834ac2a0 f_8572f040").split()
+out += [n for n in ZSTD_DECODER if n not in out]
 open(sys.argv[2], "w").write("".join(n + "\n" for n in out))
 print("%d samples in %d functions; %d functions cover %.0f%%" % (total, len(c), len(out), 100.0 * acc / max(1, total)))

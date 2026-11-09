@@ -248,6 +248,14 @@ Id EmitStorageAtomicExchange32(EmitContext& ctx, const IR::Value& binding, const
     return StorageAtomicU32(ctx, binding, offset, value, &Sirit::Module::OpAtomicExchange);
 }
 
+Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                                      Id comparator, Id value) {   // (hookshot: ATOMG.CAS)
+    const Id pointer{StoragePointer(ctx, ctx.storage_types.U32, &StorageDefinitions::U32, binding,
+                                    offset, sizeof(u32))};
+    const auto [scope, semantics]{AtomicArgs(ctx)};
+    return ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope, semantics, semantics, value, comparator);
+}
+
 Id EmitStorageAtomicIAdd64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                            Id value) {
     return StorageAtomicU64(ctx, binding, offset, value, &Sirit::Module::OpAtomicIAdd,
@@ -488,6 +496,13 @@ Id EmitGlobalAtomicExchange32(EmitContext& ctx, Id address, Id value) {   // (ho
     return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_global_func_u32[8], address, value);
 }
 
+Id EmitGlobalAtomicCompareExchange32(EmitContext& ctx, Id address, Id comparator, Id value) {   // (hookshot: the fallback)
+    if (!Sirit::ValidId(ctx.atomic_global_cas_func_u32)) {
+        throw NotImplementedException("SPIR-V Instruction");
+    }
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_global_cas_func_u32, address, comparator, value);
+}
+
 Id EmitGlobalAtomicIAdd64(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
@@ -576,8 +591,11 @@ Id EmitGlobalAtomicExchange32x2(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
 
-Id EmitGlobalAtomicAddF32(EmitContext&) {
-    throw NotImplementedException("SPIR-V Instruction");
+Id EmitGlobalAtomicAddF32(EmitContext& ctx, Id address, Id value) {   // (hookshot: the fallback)
+    if (!Sirit::ValidId(ctx.atomic_global_add_f32_func)) {
+        throw NotImplementedException("SPIR-V Instruction");
+    }
+    return ctx.OpFunctionCall(ctx.F32[1], ctx.atomic_global_add_f32_func, address, value);
 }
 
 Id EmitGlobalAtomicAddF16x2(EmitContext&) {

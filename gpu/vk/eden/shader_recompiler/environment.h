@@ -99,6 +99,14 @@ public:
 
     [[nodiscard]] virtual bool HasNativeInstructions() const { return false; }   // (from Lichii)
 
+    /// (from Fritchii) A Switch 2 native program lowered to Maxwell instructions. Its storage buffer pointers are
+    /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
+    [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
+
+    /// (from Fritchii) Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
+    /// Native argument tables mix pointers with scalars (sizes, strides).
+    [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
+
     [[nodiscard]] virtual std::optional<ReplaceConstant> GetReplaceConstBuffer(u32 bank,
                                                                                u32 offset) = 0;
 

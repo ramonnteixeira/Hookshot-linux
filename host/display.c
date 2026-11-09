@@ -4,17 +4,18 @@
    no emulated GPU, so the renderer is the only way to a picture.
    HOS_HEADLESS=1: no window (scripted runs; the renderer draws offscreen). Closing the window ends the run.
    HOS_WINDOW_NOACTIVATE=1: the window opens behind the one in front (test runs do not take the keyboard).
-   HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11: fullscreen.
+   HOS_WINDOW_SIZE=<w>x<h>: the client area (default 1280x720 at 96 dpi). F11 or Alt+Enter: fullscreen.
    Mouse: a click in the window captures the mouse (hidden, kept in the window), Esc or leaving the window releases
-   it (nn_hid.c reads its motion). */
-#ifdef _WIN32   /* (linux port: display_sdl.c) */
+   it (nn_hid.c reads its motion). While the Insert menu is open the mouse is free (the cursor shown, for the menu's
+   clicks: hos_mouse_pointer) and the game gets none of it; the capture it had comes back when the menu closes. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 #include "../gpu/render/rx.h"
+#include "../gpu/vk/vk_api.h"
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -32,6 +33,30 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
     *dx = InterlockedExchange(&mouse_dx, 0);
     *dy = InterlockedExchange(&mouse_dy, 0);
     return mouse_captured;
+}
+
+/* (mouse_native.c) motion taken and not used, put back for the next taker (the stick's, while no camera is found) */
+void hos_mouse_give_back(int32_t dx, int32_t dy) {
+    InterlockedExchangeAdd(&mouse_dx, dx);
+    InterlockedExchangeAdd(&mouse_dy, dy);
+}
+
+/* the free mouse, for the Insert menu (gpu/vk/vk_api.h MkwVkPointer): set on the window's thread, read on the renderer's */
+static volatile LONG ptr_x, ptr_y, ptr_w, ptr_h, ptr_in, ptr_pressed, ptr_wheel;   /* (client pixels; wheel in WHEEL_DELTA units) */
+static int menu_open, captured_before_menu;
+
+int hos_mouse_pointer(MkwVkPointer *out) {
+    memset(out, 0, sizeof *out);
+    if (!hwnd || mouse_captured) return 0;
+    out->x = ptr_x, out->y = ptr_y, out->width = ptr_w, out->height = ptr_h;
+    out->held = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? HOS_MOUSE_LEFT : 0) |
+                ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) ? HOS_MOUSE_RIGHT : 0) |
+                ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) ? HOS_MOUSE_MIDDLE : 0);
+    out->pressed = (uint32_t)InterlockedExchange(&ptr_pressed, 0);
+    const LONG wheel = InterlockedExchange(&ptr_wheel, 0);
+    out->wheel = wheel / WHEEL_DELTA;
+    if (wheel % WHEEL_DELTA) InterlockedExchangeAdd(&ptr_wheel, wheel % WHEEL_DELTA);   /* (a part of a notch: kept) */
+    return ptr_in && GetForegroundWindow() == hwnd && out->width > 0 && out->height > 0;
 }
 
 static HANDLE renderer_up;
@@ -93,10 +118,64 @@ static void mouse_capture(HWND w, int on) {
     }
 }
 
+/* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
+static void menu_mouse(HWND w, int open) {
+    if (open == menu_open) return;
+    menu_open = open;
+    if (open) {
+        captured_before_menu = (int)mouse_captured;
+        mouse_capture(w, 0);
+        InterlockedExchange(&ptr_pressed, 0), InterlockedExchange(&ptr_wheel, 0);
+    } else {
+        if (captured_before_menu && GetForegroundWindow() == w) mouse_capture(w, 1);
+        captured_before_menu = 0;
+    }
+}
+static void menu_press(HWND w, LPARAM lp, LONG bit) {   /* (a click while the menu is open: the menu's) */
+    ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp), ptr_in = 1;
+    InterlockedOr(&ptr_pressed, bit);
+    SetCapture(w);   /* (a drag past the window's edge still reaches it) */
+}
+
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_MOUSEMOVE:
+        ptr_x = (short)LOWORD(lp), ptr_y = (short)HIWORD(lp);
+        if (!ptr_in) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
+            TrackMouseEvent(&t);
+            ptr_in = 1;
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        ptr_in = 0;
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (menu_open) InterlockedExchangeAdd(&ptr_wheel, GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    case WM_RBUTTONDOWN:
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_RIGHT);
+        return 0;
+    case WM_MBUTTONDOWN:
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_MIDDLE);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONUP:
+        if (GetCapture() == w && !(wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) ReleaseCapture();
+        return 0;
+    case WM_APP + 8:   /* (the Insert menu opened or closed: gpu/vk/vk_menu.cpp) */
+        menu_mouse(w, (int)wp);
+        return 0;
     case WM_TIMER:
         return 0;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
+            renderer && GetForegroundWindow() == w && !IsIconic(w)) {
+            BOOL secure = TRUE;   /* unknown or protected policy keeps Windows' normal handling */
+            if (SystemParametersInfoA(SPI_GETSCREENSAVESECURE, 0, &secure, 0) && !secure) return 0;
+        }
+        break;
     case WM_INPUT: {
         RAWINPUT ri;
         UINT size = sizeof ri;
@@ -108,12 +187,25 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcA(w, msg, wp, lp);
     }
     case WM_LBUTTONDOWN:
-        if (renderer && !mouse_captured) mouse_capture(w, 1);
+        if (menu_open) menu_press(w, lp, HOS_MOUSE_LEFT);
+        else if (renderer && !mouse_captured) mouse_capture(w, 1);
         return 0;
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
+        extern void hos_vk_note_key_press(unsigned key);
+        if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
         return 0;
+    }
+    case WM_SYSKEYDOWN:   /* Alt+Enter, as on Linux (display_sdl.c); other Alt keys (Alt+F4) go on to Windows */
+        if (wp == VK_RETURN && (lp & (1 << 29))) {
+            if (!(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
+            return 0;
+        }
+        break;
+    case WM_SYSCHAR:   /* (its character: without this Windows beeps, as for an Alt key with no menu) */
+        if (wp == '\r') return 0;
+        break;
     case WM_APP + 7:   /* (the Insert menu's row) */
         set_fullscreen(w, (int)wp);
         return 0;
@@ -138,6 +230,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (mouse_captured) { mouse_capture(w, 0); mouse_capture(w, 1); }   /* (the clip follows the window) */
         break;
     case WM_SIZE:
+        ptr_w = LOWORD(lp), ptr_h = HIWORD(lp);
         if (mouse_captured) { mouse_capture(w, 0); mouse_capture(w, 1); }
         if (renderer) rx_resize(LOWORD(lp), HIWORD(lp));
         return 0;
@@ -229,4 +322,3 @@ void hos_display_start(void) {
     renderer_up = CreateEventA(NULL, TRUE, FALSE, NULL);
     CreateThread(NULL, 0, display_main, NULL, 0, NULL);
 }
-#endif /* _WIN32 */

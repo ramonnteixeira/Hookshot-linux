@@ -2,11 +2,12 @@
    The answers describe a docked console in English (HOS_LANGUAGE / language.txt: another language) with one user,
    "Player". */
 #include "hos.h"
+#include "hos_paths.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include "win32_compat.h"   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
+#include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
 
 static int64_t boot_ns;
 
@@ -32,8 +33,8 @@ static const char *desired_language(void) {
         from = "HOS_LANGUAGE";
     } else {
         char path[300] = "language.txt";
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-        DWORD n = GetModuleFileNameA(NULL, path, 260);
+#if !defined(__EMSCRIPTEN__)   /* (linux too: host/posix) */
+        DWORD n = hos_game_path_a(path, 260);
         while (n > 0 && path[n - 1] != 92 && path[n - 1] != 47) n--;
         snprintf(path + n, sizeof path - n, "language.txt");
 #endif
@@ -72,7 +73,7 @@ static const char *desired_language(void) {
     snprintf(lang, sizeof lang, "en-US");
     int found = 0;
     for (size_t i = 0; want[0] && i < sizeof languages / sizeof *languages; i++)
-        if (!strcmp(want, languages[i].code)) snprintf(lang, sizeof lang, "%s", languages[i].code), found = 1;
+        if (!_stricmp(want, languages[i].code)) snprintf(lang, sizeof lang, "%s", languages[i].code), found = 1;   /* (HOS_LANGUAGE=pt-br too, as language.txt) */
     if (want[0] && !found) hos_log("oe: language \"%s\" (%s) is not one the game has: English (US)", want, from);
     else hos_log("oe: language %s (%s)", lang, from);
     return lang;
@@ -84,26 +85,48 @@ HLE(_ZN2nn2oe18GetDesiredLanguageEv) {
 }
 /* HOS_HANDHELD=1: handheld (the 1080p screen: 1080p output and the game's handheld resolutions) instead of docked
    (MKW docked composes 3840 x 2160) */
+static int ini_option(const char *key, int otherwise) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
+    char path[MAX_PATH];
+    const DWORD n = hos_game_path_a(path, MAX_PATH);
+    char *slash = n ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/'; the game folder's, not bin\\'s) */
+    if (!slash) return otherwise;
+    snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
+    FILE *f = fopen(path, "r");
+    if (!f) return otherwise;
+    char line[80];
+    const size_t len = strlen(key);
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, len) && line[len] == '=') otherwise = atoi(line + len + 1);
+    fclose(f);
+    return otherwise;
+}
 static int handheld(void) {
     static int v = -1;
+    if (v < 0) v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : ini_option("handheld_profile", 0) != 0;
+    return v;
+}
+/* (hookshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: 0 the game's 2048 x 1152,
+   1 2560 x 1440, 2 3840 x 2160. The game's frame is its display size (2560 x 1440 as shipped; nx2/oot_patches.py
+   apply_output_size asks hos_output_size) times its graphics scale (GetCurrentGraphicsScale: 0 x1, 1 x0.8, 2 x0.667). Here it
+   saw scale 1 (x0 left at the call before's answer), so 2048 x 1152; 1 and 2 ask for x1 of a 2560 x 1440 or 3840 x 2160 display. */
+static int output_mode(void) {
+    static int v = -1;
     if (v < 0) {
-        v = getenv("HOS_HANDHELD") && atoi(getenv("HOS_HANDHELD")) != 0;
-        if (!getenv("HOS_HANDHELD")) {   /* (hookshot: the Insert menu's choice, gpu/vk/vk_menu.cpp) */
-            char path[MAX_PATH];
-            const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-            char *slash = n ? strrchr(path, HOS_SEP) : NULL;
-            if (slash) {
-                snprintf(slash + 1, (size_t)(path + MAX_PATH - slash - 1), "hookshot_options.ini");
-                FILE *f = fopen(path, "r");
-                if (f) {
-                    char line[80];
-                    while (fgets(line, sizeof line, f))
-                        if (!strncmp(line, "handheld_profile=", 17)) v = atoi(line + 17) != 0;
-                    fclose(f);
-                }
-            }
-        }
+        v = getenv("HOS_OUTPUT_RES") ? atoi(getenv("HOS_OUTPUT_RES")) : ini_option("output_res", 0);
+        if (v < 0 || v > 2 || handheld()) v = 0;
+        hos_log("oe: output resolution %s", v == 2 ? "3840x2160" : v == 1 ? "2560x1440" : "2048x1152 (the game's)");
     }
+    return v;
+}
+uint32_t hos_output_size(int height) { return output_mode() == 2 ? (height ? 2160 : 3840) : (height ? 1440 : 2560); }
+/* (hookshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
+   the 4K output ran out of it. Scaled with the output's pixels; HOS_RT_POOL_MB=<MB> over it */
+uint64_t hos_rt_pool_size(uint64_t game) {
+    const char *e = getenv("HOS_RT_POOL_MB");
+    const uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
+    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    static int logged;
+    if (!logged++) hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
     return v;
 }
 HLE(_ZN2nn2oe16GetOperationModeEv) { RET(handheld() ? 0 : 1); }     /* OperationMode_Handheld / _Console (docked) */
@@ -334,6 +357,7 @@ HLE(_ZN2nn2oe23GetCurrentGraphicsScaleEv) {
     uint32_t bits;
     memcpy(&bits, &one, 4);
     c->vreg[0][0] = bits, c->vreg[0][1] = 0;
+    c->x[0] = output_mode() ? 0 : 1;   /* (the scale enum the game reads, w0: x1 for a chosen output, x0.8 as before) */
 }
 HLE(_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb) {}
 HLE(_ZN2nn2oe31EnterExitRequestHandlingSectionEv) {}

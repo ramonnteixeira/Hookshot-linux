@@ -10,6 +10,7 @@
 // with the Switch 2 GOB swizzle); other formats are unswizzled on the CPU straight into the staging memory.
 #pragma once
 
+#include <string>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +43,7 @@ struct Texture {
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
     bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
+    bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
     // the game's texture
     uint64_t gpu = 0, guest = 0, guest_size = 0;   // storage (GPU address, guest address, bytes)
@@ -71,7 +73,8 @@ struct Texture {
     uint64_t last_frame = 0;  // the present it was last used in (the cache's age)
     uint64_t first_render_frame = 0;   // the present it was first rendered into in (0: never)
     uint64_t last_value = 0;  // the timeline value of the last submission that used it
-    uint64_t bytes = 0;       // device memory it holds
+    uint64_t bytes = 0;       // device memory it holds (the texels', or a sparse image's chunks)
+    uint64_t pad = 0;         // (what the allocator gave it beyond that: padding and alignment; counted in the budget with bytes)
     uint32_t id = 0;          // (its creation number: diagnostics tell images at one address apart)
     uint64_t first_seen = 0;  // (the present it was made at)
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))
@@ -163,7 +166,10 @@ uint64_t texture_made();
 void texture_unswizzle_stats(int64_t* bytes, int64_t* ns);
 uint64_t texture_bytes();
 /// A full memory barrier (all commands, all accesses): what separates dependent work for now
-void full_barrier(VkCommandBuffer cmd);
+/// (why: its label in RX_VK_PASS_TIMING's barrier lines)
+void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
+/// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
+void barrier_stats(int64_t* made, int64_t* left_out);
 void texture_stats(int64_t* uploads, int64_t* astc_gpu, int64_t* bytes_uploaded);
 /// RX_VK_DUMP_TEX: the textures uploaded next written to that folder as PPM (diagnostics)
 void texture_read_texels(const nvn_tex* t, unsigned level, unsigned layer0, const NVNcopyRegion* r, uint8_t* dst,

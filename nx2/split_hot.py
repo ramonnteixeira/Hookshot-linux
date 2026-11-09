@@ -2,9 +2,9 @@
 
     python -I nx2/split_hot.py [gen folder] [pieces, default 8]
 
-Functions that call each other stay together, heaviest calls first, so what used to inline still can. The pieces are about the same
-size. code_hot.c stays as it was, renamed code_hot.c.whole, and build.py compiles code_hot_*.c at the hot flags. A profile from the whole
-file fits the pieces: its counters go by function name and shape.
+Functions that call each other stay together, heaviest calls first, so what used to inline still can. The pieces cost about the
+same to compile (chunks.fn_cost). code_hot.c stays as it was, renamed code_hot.c.whole, and build.py compiles code_hot_*.c at the
+hot flags. A profile from the whole file fits the pieces: its counters go by function name and shape.
 """
 import collections
 import glob
@@ -12,7 +12,12 @@ import os
 import re
 import sys
 
-HEAD = re.compile(r"^void (f_[0-9a-f]+)\(Ctx \*__restrict A64_NOESC c\) \{", re.M)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # (python -I leaves the script folder off)
+import kit  # noqa: E402,F401  (a64-kit on the path, for chunks)
+import chunks  # noqa: E402
+import lifted_c  # noqa: E402
+
+HEAD = lifted_c.HEAD
 CALL = re.compile(r"\b(f_[0-9a-f]{8})\(c\)")
 
 
@@ -55,17 +60,23 @@ def split(gen, pieces):
     groups = collections.defaultdict(list)
     for f in bodies:
         groups[root(f)].append(f)
+    # (the groups dealt out by their compile cost, not their size: a piece's time goes with the square of its functions' sizes, and by
+    # size one piece took 333 s and another 60)
+    cost = {f: chunks.fn_cost(len(b)) for f, b in bodies.items()}
     bins = [[0, []] for _ in range(pieces)]
-    for g in sorted(groups.values(), key=lambda g: -sum(len(bodies[f]) for f in g)):
+    for g in sorted(groups.values(), key=lambda g: (-sum(cost[f] for f in g), min(g))):
         b = min(bins, key=lambda x: x[0])
-        b[0] += sum(len(bodies[f]) for f in g)
+        b[0] += sum(cost[f] for f in g)
         b[1].extend(g)
-    for i, (bytes_, names) in enumerate(bins):
+    costs = {}
+    for i, (c, names) in enumerate(bins):
         with open(os.path.join(gen, "code_hot_%d.c" % i), "w", encoding="utf-8", newline="") as f:
             f.write(preamble)
             for name in sorted(names):
                 f.write(bodies[name])
-        print("split_hot: piece %d: %d functions, %d MB" % (i, len(names), bytes_ >> 20))
+        costs["code_hot_%d.c" % i] = len(preamble) + c
+        print("split_hot: piece %d: %d functions, %d MB, cost %d MB" % (i, len(names), sum(len(bodies[f]) for f in names) >> 20, c >> 20))
+    chunks.write_costs(gen, costs)
     kept = sum(n for (f, c), n in edges.items() if root(f) == root(c))
     print("split_hot: %d of %d calls stay in one group" % (kept, sum(edges.values())))
 

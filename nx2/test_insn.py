@@ -84,7 +84,7 @@ def main():
     insn_test.unicorn = _Unicorn
     insn_test.mem_regs = mem_regs
     base_target = toolchain.native_target
-    toolchain.native_target = lambda: base_target() + ["-mcx16"]
+    toolchain.native_target = lambda *a, **k: base_target(*a, **k) + ["-mcx16"]
     base_sample = insn_test.sample
 
     def sample(image_dir, mods, per, rng):

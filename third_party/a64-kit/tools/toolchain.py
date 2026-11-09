@@ -7,7 +7,24 @@ def emsdk():
     return os.environ.get("EMSDK") or (r"C:\emsdk" if os.name == "nt" else os.path.expanduser("~/emsdk"))
 
 
-def find(tool):
+def windows():
+    """(hookshot) the game is built for Windows: on Windows, or with RX_TARGET=windows on another system (a cross build, with
+    llvm-mingw's release for that system in HOOKSHOT_MINGW)"""
+    return os.name == "nt" or os.environ.get("RX_TARGET", "").lower() == "windows"
+
+
+def mingw(host=False):
+    """(hookshot) HOOKSHOT_MINGW=<llvm-mingw folder>: Windows builds with that toolchain's clang, headers and libraries (the GNU ABI
+    on the UCRT), as TotK Recomp's installer does: nothing of Visual Studio or the Windows SDK is needed. Empty: the MSVC target.
+    host: for a tool the build itself runs (zbic, a64emit), which a cross build makes for this PC, not for Windows"""
+    return os.environ.get("HOOKSHOT_MINGW", "") if windows() and not (host and os.name != "nt") else ""
+
+
+def find(tool, host=False):
+    if mingw(host) and (tool in ("clang", "clang++", "lld") or tool.startswith("llvm-")):
+        path = os.path.join(mingw(host), "bin", ("ld.lld" if tool == "lld" else tool) + (".exe" if os.name == "nt" else ""))
+        if os.path.isfile(path):
+            return path
     root = emsdk()
     exts = (".exe", ".bat") if os.name == "nt" else ("",)
     native = tool in ("clang", "clang++", "lld") or tool.startswith("llvm-")
@@ -28,23 +45,35 @@ def need(path):
 
 def lld_link():
     """emsdk's lld under the name lld-link (lld picks its COFF linker from its own file name), made on first use"""
-    path = os.path.join(HERE, "lld-link.exe")
+    path = os.path.join(HERE, "lld-link-mingw.exe" if mingw() else "lld-link.exe")
     if not os.path.exists(path):
         shutil.copyfile(need(find("lld")), path)
     return path
 
 
-def native_target():
+def native_target(host=False):
+    if mingw(host):   # (-fms-extensions: __try/__except and __declspec, which clang takes on this target too)
+        return ["--target=x86_64-w64-mingw32", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"]
     return ["--target=x86_64-pc-windows-msvc", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"] if os.name == "nt" else []
 
 
-def native_link():
+def native_link(host=False):
     # (-fuse-ld=lld, found through -B: clang ignores --ld-path for the MSVC target and ran Microsoft's link.exe, which
     # cannot read the renderer's ThinLTO bitcode)
-    if os.name == "nt":
-        return ["-fuse-ld=lld", "-B" + os.path.dirname(lld_link())]
-    # (linux port) lld when it is there: its symbol ordering file is how the hot functions are packed together
-    return ["-fuse-ld=lld"] if shutil.which("ld.lld") or os.path.isfile(find("ld.lld")) else []
+    if mingw(host):   # (its own lld; the C++ runtime and winpthread linked in, so no DLLs of the toolchain go beside the game)
+        # (/nodefaultlib: libraries built with Microsoft's compiler, the CPM cache's FFmpeg, ask in their objects for its C runtime;
+        # the MinGW one stands in, with host/mingw_msvc_shims.c for what it lacks)
+        return ["-fuse-ld=lld", "-static"] + ["-Wl,-Xlink=/nodefaultlib:" + l for l in ("libcmt", "oldnames", "libvcruntime", "msvcrt")]
+    # (issue 439: clang names oldnames.lib as a default library for the MSVC target, and recent Windows SDKs no longer
+    # ship it (an older SDK has it in ucrt\x64; Visual Studio has its own copy in its lib folder). The game and host use
+    # no legacy non-underscore name; the ones the prebuilt static FFmpeg libraries ask for are host/msvc_oldnames.c)
+    return (["-fuse-ld=lld", "-B" + os.path.dirname(lld_link()), "-Wl,/nodefaultlib:oldnames"]
+            if os.name == "nt" else [])
+
+
+def link_opt(opt):
+    """A link.exe-style option ("/map:x"): as it is for the MSVC target, through lld's MinGW driver (-Xlink) for llvm-mingw"""
+    return "-Wl,-Xlink=" + opt if mingw() else "-Wl," + opt
 
 
 def default_jobs(gb_per_job=3.5):

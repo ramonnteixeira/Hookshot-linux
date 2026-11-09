@@ -11,6 +11,7 @@
 #include <cassert>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <string_view>
 #include <unordered_map>
@@ -238,6 +239,8 @@ public:
     }
 
     Id operator<<(EndOp) {
+        // Structures with identical members can have different layout decorations.
+        if (stream.words[stream.op_index] == static_cast<u32>(spv::Op::OpTypeStruct)) return stream << EndOp{};
         const auto begin = stream.words.data();
         std::vector<u32> declarations(begin + stream.op_index, begin + stream.insert_index);
 

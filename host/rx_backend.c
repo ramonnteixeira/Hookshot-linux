@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 
 #include "../gpu/vk/vk_api.h"
 
@@ -50,6 +50,10 @@ int hos_gpu_pools(uint64_t (*out)[2], int max);
 uint32_t hos_gpu_maps_generation(void);
 uint32_t nvn_vmap_generation(void);
 uint64_t hos_reserved_cpus(void);   /* hos_thread.c */
+extern float hos_aspect_ratio;      /* hos_main.c: the guest camera aspect applied at startup, or 0 */
+uint32_t hos_pad_raw(void);         /* nn_hid.c: the gamepads and the controls, for the Insert menu */
+int hos_binding(int set, int button, int slot);
+void hos_bind(int set, int button, int slot, int code);
 #if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
 void hos_mark_written(const void *p, size_t n);
 #endif
@@ -129,27 +133,54 @@ static uint64_t host_guest_alloc(uint64_t size) {
 
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size);   /* nvn_native.c */
 static void host_watch_guest_writes(uint64_t guest, uint64_t size) { hos_watch_guest_writes(hos_guest_base() + guest, size); }
+static float host_aspect_ratio(void) { return hos_aspect_ratio; }
+int hos_mouse_pointer(MkwVkPointer *out);   /* display.c, posix/display_sdl.c */
+
+#ifdef _WIN32
+static unsigned char menu_key_press[256];
+void hos_vk_note_key_press(unsigned key) {
+    if (key < sizeof menu_key_press) __atomic_store_n(&menu_key_press[key], 1, __ATOMIC_RELAXED);
+}
+int hos_vk_take_key_press(int key) {
+    return (unsigned)key < sizeof menu_key_press &&
+           __atomic_exchange_n(&menu_key_press[key], 0, __ATOMIC_RELAXED);
+}
+#define host_take_key_press hos_vk_take_key_press
+#else
+#define host_take_key_press NULL
+#endif
 
 static const MkwVkHost vk_host = {
     MKWVK_API_VERSION, host_log, hos_guest_base, hos_guest_size, hos_gpu_ptr, nvn_gpu_guest, nvn_gpu_read,
     nvn_gpu_write, host_collect, host_free_pages, host_mark_written, hos_ticks, hos_now_ns, nvn_tex_layout,
     nvn_tex_level_offset, nvn_fmt_bpb, nvn_tex_level_tiles, nvn_tex_linear_stride, nvn_depth_minus_w, hos_gpu_pools,
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
-    host_watch_guest_writes,
+    host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
+    hos_mouse_pointer,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
 
 /* The game registers its first textures and samplers before the window's thread starts the renderer (NVN is up
    first): those calls are kept here and given to the renderer rx_start chose, in order. Without that the Vulkan back
-   end never knew the first ~0x60 texture slots, and lit geometry sampled them as its black dummy. */
+   end never knew the first ~0x60 texture slots, and lit geometry sampled them as its black dummy.
+   The texels the game writes then (WriteTexels) are kept too, with a copy of their data: without a renderer they went
+   nowhere (Linux has no WebGPU renderer to take them), and a texture filled so at boot kept zeros in its storage. OoT's
+   4x4 white placeholder is one: bound in place of the ground fog's depth, it read 0 and hid the ground fog at some camera
+   angles. That happened when the window's thread started the renderer after the game had begun (windowed, not headless). */
 typedef struct {
-    int kind;   /* 0 texture registration, 1 sampler registration, 2 texture pool size, 3 texture finalized */
+    int kind;   /* 0 texture registration, 1 sampler registration, 2 texture pool size, 3 texture finalized, 4 texture
+                   made, 5 texels written */
     int id;
     nvn_tex t;
     nvn_view v;
     int has_view;
     nvn_samp_par p;
+    /* (5: WriteTexels) */
+    unsigned level, layer0;
+    NVNcopyRegion r;
+    uint64_t row, img;
+    uint8_t *data;
 } early_call;
 static early_call *early;
 static size_t n_early, cap_early;
@@ -176,8 +207,14 @@ static int keep_early(const early_call *c) {
 /* rx_start: the kept calls given to the renderer chosen, then the gate opened */
 static void flush_early(void) {
     AcquireSRWLockExclusive(&early_lock);
-    for (size_t i = 0; i < n_early; i++) forward(&early[i]);
-    if (n_early) hos_log("rx: %zu texture and sampler calls made before the renderer started, given to it", n_early);
+    size_t texels = 0;
+    for (size_t i = 0; i < n_early; i++) {
+        forward(&early[i]);
+        if (early[i].kind == 5) texels++, free(early[i].data);
+    }
+    if (n_early)
+        hos_log("rx: %zu texture and sampler calls made before the renderer started (%zu texel writes), given to it", n_early,
+                texels);
     free(early);
     early = NULL, n_early = cap_early = 0;
     InterlockedExchange(&started, 1);
@@ -188,7 +225,7 @@ static void flush_early(void) {
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
     const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-    char *slash = n ? strrchr(path, HOS_SEP) : NULL;
+    char *slash = n ? (strrchr(path, '\\') ? strrchr(path, '\\') : strrchr(path, '/')) : NULL;   /* (linux: '/') */
     if (!slash) return NULL;
     strcpy(slash + 1, dll);
     HMODULE m = LoadLibraryA(path);
@@ -223,6 +260,12 @@ int rx_start(void *hwnd) {
     flush_early();
     return ok;
 }
+/* (hookshot) hookshot --prepare-shaders: the Vulkan back end started with no window and no game, which prepares
+   every shader in its start (gpu/vk/vk_main.cpp started_up) and is then let go. 0 when there is no usable Vulkan */
+int rx_prepare_shaders(void) {
+    const MkwVkRenderer *r = load_vulkan("hookshot_vk.dll");
+    return r && r->start(NULL);
+}
 void rx_resize(int width, int height) { vk ? vk->resize(width, height) : wgr_resize(width, height); }
 const char *rx_describe(void) { return vk ? vk->describe() : wgr_describe(); }
 void rx_stats(int64_t *draws, int64_t *skipped, int64_t *pipelines) {
@@ -234,6 +277,7 @@ void rx_nvn_submit_q(const uint64_t *handles, int n, uint64_t queue) {
     else rx_nvn_submit(handles, n);
 }
 uint64_t rx_nvn_fence(void) { return vk ? vk->nvn_fence() : wgr_nvn_fence(); }
+uint64_t rx_nvn_fence_q(uint64_t queue) { return vk && vk->nvn_fence_q ? vk->nvn_fence_q(queue) : rx_nvn_fence(); }
 uint64_t rx_nvn_pushed(void) { return vk ? vk->nvn_pushed() : wgr_nvn_pushed(); }
 uint64_t rx_nvn_replayed(void) { return vk ? vk->nvn_replayed() : wgr_nvn_replayed(); }
 int rx_nvn_wait(uint64_t fence, uint64_t timeout_ns) {
@@ -255,6 +299,10 @@ static void forward(const early_call *c) {
     case 2: vk ? vk->nvn_set_texture_pool_size(c->id) : wgr_nvn_set_texture_pool_size(c->id); break;
     case 3: vk ? vk->nvn_texture_released(&c->t) : wgr_nvn_texture_released(&c->t); break;
     case 4: if (vk && vk->nvn_texture_created) vk->nvn_texture_created(&c->t); break;
+    case 5:
+        vk ? vk->nvn_write_texels(&c->t, c->level, c->layer0, &c->r, c->data, c->row, c->img)
+           : wgr_nvn_write_texels(&c->t, c->level, c->layer0, &c->r, c->data, c->row, c->img);
+        break;
     }
 }
 void rx_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) {
@@ -304,10 +352,33 @@ void rx_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, const
 }
 void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src,
                          size_t row, size_t img) {
+    if (!started && t && r && src) {   /* (kept with a copy of the data: the caller's buffer is its own again on return) */
+        int bw = 1, bh = 1;
+        const int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+        if (bpb > 0 && bw > 0 && bh > 0 && r->width > 0 && r->height > 0) {
+            const uint64_t wb = (uint64_t)((r->width + bw - 1) / bw) * (uint64_t)bpb, hb = (uint64_t)((r->height + bh - 1) / bh);
+            const uint64_t depth = r->depth > 0 ? (uint64_t)r->depth : 1;
+            /* (the bytes the copy reads: the last row of the last slice ends the data, whatever the strides) */
+            const uint64_t n = (depth - 1) * img + (hb - 1) * row + wb;
+            early_call c = {5, 0};
+            c.t = *t, c.level = level, c.layer0 = layer0, c.r = *r, c.row = row, c.img = img;
+            c.data = (uint8_t *)malloc(n);
+            if (c.data) {
+                memcpy(c.data, src, n);
+                if (keep_early(&c)) return;
+                free(c.data);
+            }
+        }
+    }
     vk ? vk->nvn_write_texels(t, level, layer0, r, src, row, img)
        : wgr_nvn_write_texels(t, level, layer0, r, src, row, img);
 }
-void rx_nvn_invalidate(uint64_t gpu, uint64_t size) { vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size); }
+void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
+    /* The callback can wait for replay or GPU write-back: let another guest thread use this core meanwhile. */
+    const int away = hos_vcore_away();
+    vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size);
+    if (away) hos_vcore_back();
+}
 int rx_guest_imported(uint64_t lo, uint64_t hi) {
     /* (mkw-recomp 16bc3bc: it takes the back end's pool lock, which the replay holds at times: no virtual core held) */
     const int away = hos_vcore_away();
@@ -317,6 +388,7 @@ int rx_guest_imported(uint64_t lo, uint64_t hi) {
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }
+void rx_option_set(int id, int value) { if (vk && vk->option_set) vk->option_set(id, value); }
 void rx_nvn_event_signal(uint64_t gpu, uint32_t value) {
     if (vk && vk->nvn_event_signal) vk->nvn_event_signal(gpu, value);
 }

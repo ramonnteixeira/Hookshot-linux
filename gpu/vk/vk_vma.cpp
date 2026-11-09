@@ -35,7 +35,9 @@ bool vma_init(PFN_vkGetInstanceProcAddr gipa) {
 // memory type the pool's is not, are allocated as before.
 VmaPool image_pool = VK_NULL_HANDLE;
 bool image_pool_tried = false;
-constexpr uint64_t kImageBlock = 128ull << 20;
+// (RX_VK_IMAGE_BLOCK_MB=<n>, 16 and up: the block's size. VMA keeps one block empty for the next image, 128 MB of VRAM that a 64 MB block
+// would halve, at twice the memory objects: the driver allows ~4096, the imported pools take ~2400)
+const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : 128u) << 20;
 
 VmaPool images_pool() {
     if (image_pool_tried) return image_pool;
@@ -61,13 +63,18 @@ VmaPool images_pool() {
     return image_pool;
 }
 
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation) {
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     // (in VRAM or not at all: an image VMA puts in system memory when VRAM is full is read over PCIe every frame,
     // and takes the RAM the game and everything else on the machine need)
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    if (dedicated) {   // (a memory object of its own, which freeing gives back whole: a pool's block is kept by VMA when it empties)
+        VmaAllocationCreateInfo dai = ai;
+        dai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        if (vmaCreateImage(vma, &ci, &dai, &image, &allocation, nullptr) == VK_SUCCESS) return true;
+    }
     static const bool no_pool = getenv("RX_VK_NO_IMAGE_POOL") != nullptr;
     if (VmaPool pool = no_pool ? VK_NULL_HANDLE : images_pool()) {
         VmaAllocationCreateInfo pai = ai;
@@ -89,14 +96,23 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
 void destroy_image(VkImage image, VmaAllocation allocation) {
     vmaDestroyImage(vma, image, allocation);
 }
+uint64_t allocation_size(VmaAllocation allocation) {
+    VmaAllocationInfo info{};
+    if (allocation) vmaGetAllocationInfo(vma, allocation, &info);
+    return info.size;
+}
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
-                   VmaAllocation& allocation, void** mapped) {
+                   VmaAllocation& allocation, void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
     if (host_visible) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    // (a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT from VMA:
+    // vma_init sets VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT)
+    static const bool blocks = getenv("RX_VK_BLOCK_BUFFERS") != nullptr;
+    if (dedicated && !blocks) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
@@ -105,13 +121,14 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
 /// A buffer in cached host memory, mapped: written on one thread, read back on the CPU too (the captures: the game's
 /// threads copy pages into it, the replay reads texture pages out of it and the GPU copies the rest from it)
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
-                          void** mapped) {
+                          void** mapped, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;   // (its own memory object: no part of a 64 MB block left unused)
     VmaAllocationInfo info{};
     if (vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
     if (mapped) *mapped = info.pMappedData;
@@ -120,10 +137,13 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 void flush_mapped(VmaAllocation allocation, uint64_t size) {
     if (size) vmaFlushAllocation(vma, allocation, 0, size);
 }
+void invalidate_mapped(VmaAllocation allocation, uint64_t size) {
+    if (size) vmaInvalidateAllocation(vma, allocation, 0, size);
+}
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
     vmaDestroyBuffer(vma, buffer, allocation);
 }
-bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation) {
+bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated) {
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
     bi.usage = usage;
@@ -131,6 +151,7 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     if (dev.memory_budget) ai.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    if (dedicated) ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     return vmaCreateBuffer(vma, &bi, &ai, &buffer, &allocation, nullptr) == VK_SUCCESS;
 }
 /// (every heap: what VMA has in blocks and allocations there, what the process uses of it, its budget; one line)
@@ -160,6 +181,20 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;
+}
+
+/// The system-memory heaps the GPU reaches: what the process uses there (the imported guest memory too: pinned by the
+/// driver) and what the driver allows it, asked now (a new frame index makes VMA ask the driver again); false when unknown
+bool system_heap_usage(uint64_t* used, uint64_t* budget) {
+    static uint32_t frame = 0;
+    vmaSetCurrentFrameIndex(vma, ++frame);
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    uint64_t u = 0, t = 0;
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (!(dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) u += b[h].usage, t += b[h].budget;
+    *used = u, *budget = t;
+    return dev.memory_budget && t != 0;
 }
 
 } // namespace mkwvk

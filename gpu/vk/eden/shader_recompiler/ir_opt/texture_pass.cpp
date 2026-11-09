@@ -1172,7 +1172,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         }
     }
     // Sort instructions to visit textures by constant buffer index, then by offset
-    std::ranges::sort(to_replace, [](const auto& a, const auto& b) {
+    std::sort(to_replace.begin(), to_replace.end(), [](const auto& a, const auto& b) {
         if (a.cbuf.index != b.cbuf.index) return a.cbuf.index < b.cbuf.index;
         return a.cbuf.offset < b.cbuf.offset;
     });
@@ -1328,7 +1328,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 });
             } else {
                 count = std::min(count, sampled_dynamic_cap);
-                const bool is_integer{is_texture_pixel_format_integer(cbuf)};
+                const bool is_integer{!flags.is_depth && is_texture_pixel_format_integer(cbuf)};
                 index = descriptors.Add(TextureDescriptor{
                     .type = flags.type,
                     .is_depth = flags.is_depth != 0,

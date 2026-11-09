@@ -9,6 +9,8 @@
 #include "vk_xfer.h"
 #include "vk_draw.h"   // (end_pass: a pass cannot stay open across a transfer)
 #include "vk_texture.h"
+#include "vk_gprof.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 namespace {
@@ -77,6 +79,13 @@ bool resolve(const nvn_tex* t, const nvn_view* v, bool has_v, const NVNcopyRegio
                  "skipped", view_level(view), view_layer(view) + (uint32_t)std::max(0, r.zoffset),
                  (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height, s.tex->layers, s.tex->nvn_format,
                  s.tex->astc ? " ASTC" : "", s.tex->skip);
+        return false;
+    }
+    if (!s.down && view_level(view) >= s.tex->skip + s.tex->levels) {   // (hookshot-amd: a level the image left out at its end)
+        static int logged;
+        if (logged++ < 20)
+            logf("vk: copy with level %u of texture %#llx %ux%u, %u levels (its last levels left out): skipped",
+                 view_level(view), (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height, s.tex->levels);
         return false;
     }
     s.level = s.down ? 0 : image_level(s.tex, view_level(view));
@@ -201,6 +210,8 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
         return;
     }
     end_pass(cmd);
+    GprofSpan gp(cmd, to_image ? "xfer copy buffer->texture (with its barriers)" : "xfer copy texture->buffer (with its barriers)");
+    gp.bytes = size;
     full_barrier(cmd);
     if (to_image) {
         vkCmdCopyBufferToImage(cmd, span.buffer, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
@@ -240,6 +251,7 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
     }
     s.layers = d.layers = std::min(s.layers, d.layers);
     end_pass(cmd);
+    GprofSpan gp(cmd, "xfer copy texture->texture (with its barriers)");
     full_barrier(cmd);
     const bool same_size = s.w == d.w && s.h == d.h && s.d == d.d;
     if (s.tex->bc != d.tex->bc || (s.tex->bc && !same_size)) {   // (big ASTC kept as BC3 on one side: vk_texture.cpp)
@@ -247,6 +259,10 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         if (d.tex->bc && same_size) {
             done = texture_copy_into_bc(cmd, s.tex, s.level, s.layer, s.x, s.y, d.tex, d.level, d.layer, d.x, d.y, s.w, s.h,
                                         s.layers);
+        } else if (s.tex->bc && !d.tex->bc && s.tex->bc_resized) {   // (hookshot-amd: its texels are not the game's)
+            static int logged;
+            if (logged++ < 8)
+                logf("vk: a copy out of resized BC3 texture %#llx left out", (unsigned long long)s.tex->gpu);
         } else if (s.tex->bc && !d.tex->bc) {   // (decompressed by a blit)
             VkFormatProperties fp{};
             vkGetPhysicalDeviceFormatProperties(dev.physical, s.tex->format, &fp);
@@ -297,6 +313,7 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     const bool whole = !s.x && !s.y && s.w == lw && s.h == lh;
     if ((p.mask & 0xf) != 0xf && (s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) warn(8, "texture clear with a channel mask: cleared whole");
     end_pass(cmd);
+    GprofSpan gp(cmd, "xfer clear texture (with its barriers)");
     full_barrier(cmd);
     if (whole && s.tex->type != VK_IMAGE_TYPE_3D) {
         VkImageSubresourceRange rng{s.tex->aspect, s.level, 1, s.layer, s.layers};

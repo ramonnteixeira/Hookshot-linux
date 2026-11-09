@@ -3,7 +3,7 @@
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
 #define WIN32_LEAN_AND_MEAN
-#include "win32_compat.h"
+#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,7 +99,16 @@ static int64_t next_frame_at, window_start, frames_in_window;
 static volatile LONG64 presents;
 int hos_vi_native_interval(Ctx *c, int requested) {
     (void)c;
-    present_interval = requested < 1 ? 1 : requested > 4 ? 4 : requested;
+    /* (hookshot) OoT's frame-rate controller asks for 2, 3 or 4 vsyncs a frame whenever one runs long (480 changes a minute
+       in Kokiri): paced to them, frames snapped to 33, 50 and 67 ms, the stutter, and the frame rate sat far under what the
+       PC managed. With game time following the clock (the Insert menu's Real time, realtime_step), a frame is shown as soon
+       as it is ready, 60 at most; the game still reads back its own interval. HOS_GAME_INTERVAL=1, or Game speed Per frame:
+       paced to the game's interval, as before */
+    static int game_interval = -1;
+    if (game_interval < 0) game_interval = getenv("HOS_GAME_INTERVAL") && atoi(getenv("HOS_GAME_INTERVAL")) != 0;
+    int rx_option(int id, int otherwise);
+    const int clamped = requested < 1 ? 1 : requested > 4 ? 4 : requested;
+    present_interval = game_interval || !rx_option(0, 1) ? clamped : 1;
     return requested;
 }
 /* (hookshot) The window's textures as the console's display queue has them: each present is shown at its display
@@ -176,15 +185,30 @@ extern volatile uint64_t hos_gfx_module;
 volatile int hos_fixed_resolution = 0;   /* (the lifted code reads these: nx2/oot_patches.py) */
 volatile uint32_t hos_fixed_scale_bits = 0x3f800000;   /* (HOS_RES_SCALE: the fixed path's scale) */
 volatile int hos_dynres_runs = 0;   /* (the dynamic path's frames: it fills fields the 3D reads, +8 +16 +168) */
+volatile float hos_text_scale = 1.0f;   /* (the letters' clock of a text pane, f_80b1e140: nx2/oot_patches.py) */
+/* The Insert menu's Text speed (0 Normal, 1 2x, 2 4x, 3 Instant), HOS_TEXT_SPEED=<0..3> over it: what the time of a letter
+   animation's step is multiplied by. Instant: the page at once, as the game's own skip on A */
+static float text_scale(const char *env, int menu) {
+    const int v = env && *env ? atoi(env) : menu;
+    return v == 1 ? 2.0f : v == 2 ? 4.0f : v >= 3 ? 1e6f : 1.0f;
+}
+volatile uint64_t hos_res_module = 0;   /* (f_831f3200's object, whose +0xe5c is the 3D's scale: nx2/oot_patches.py) */
 static void realtime_step(int64_t now) {
     int rx_option(int id, int otherwise);
     /* (Resolution 100% from the start: the fixed path skipped the dynamic block from the first frame, its fields stayed
        unset and the 3D came out black. The dynamic path runs a few frames first, as when the menu turns it on in game) */
     hos_fixed_resolution = !rx_option(2, 1) && hos_dynres_runs >= 30;
-    {   /* (the Insert menu's Resolution: the fixed path's scale, live; HOS_RES_SCALE below stays over it) */
-        const int percent = rx_option(3, 0);
-        if (percent > 0 && !getenv("HOS_RES_SCALE")) {
-            const float v = percent / 100.0f;
+    {
+        static const char *env;
+        static int looked;
+        if (!looked) looked = 1, env = getenv("HOS_TEXT_SPEED");
+        hos_text_scale = text_scale(env, rx_option(5, 0));
+    }
+    {   /* (the Insert menu's Resolution: the fixed path's scale in 1/10000, live; HOS_RES_SCALE
+           below stays over it) */
+        const int scale = rx_option(3, 0);
+        if (scale > 0 && !getenv("HOS_RES_SCALE")) {
+            const float v = scale / 10000.0f;
             memcpy((void *)&hos_fixed_scale_bits, &v, 4);
         }
     }
@@ -193,6 +217,20 @@ static void realtime_step(int64_t now) {
         if (!read_scale) {
             read_scale = 1;
             if (getenv("HOS_RES_SCALE")) { float v = (float)atof(getenv("HOS_RES_SCALE")); memcpy((void *)&hos_fixed_scale_bits, &v, 4); }
+        }
+    }
+    {   /* HOS_RES_LOG=1: the 3D's scale every 300 presents. +0xe20: flags (bit 3: 0.75, bit 4: 0.5 in place of the scale),
+           +0xe2c bit 3: recompute asked, +0xe50/+0xe54/+0xe58: the sizes the scale is taken against, +0xe5c: the scale */
+        static int on = -1;
+        static long long n;
+        if (on < 0) on = getenv("HOS_RES_LOG") != NULL;
+        const uint64_t m = hos_res_module;
+        if (on && m && !(n++ % 300)) {
+            float f[4], s;
+            memcpy(f, GP(m + 0xe50), sizeof f);
+            memcpy(&s, (const void *)&hos_fixed_scale_bits, 4);
+            hos_log("vi: res: fixed %d (scale %.3f), +0xe20 %llx, +0xe2c %x, +0xe50 %.0f %.0f %.0f, 3D scale %.3f", hos_fixed_resolution, s,
+                    (unsigned long long)*(uint64_t *)GP(m + 0xe20), *(uint32_t *)GP(m + 0xe2c), f[0], f[1], f[2], f[3]);
         }
     }
     const uint64_t mod = hos_gfx_module;
@@ -222,8 +260,14 @@ static void realtime_step(int64_t now) {
     const double dt = (now - last) / 1e9;
     last = now;
     if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; return; }   /* (a load: the average starts again) */
-    samples[next++ % 5] = dt;
-    if (count < 5) count++;
+    /* (HOS_REALTIME_WINDOW=<1-5>: frames averaged for the step; 1: each step the last frame's own time) */
+    static int window = -1;
+    if (window < 0) {
+        window = getenv("HOS_REALTIME_WINDOW") ? atoi(getenv("HOS_REALTIME_WINDOW")) : 5;
+        window = window < 1 ? 1 : window > 5 ? 5 : window;
+    }
+    samples[next++ % window] = dt;
+    if (count < (unsigned)window) count++;
     double sum = 0;
     for (unsigned i = 0; i < count; i++) sum += samples[i];
     double ratio = sum / count * 60.0 + carry;
@@ -240,6 +284,34 @@ static void realtime_step(int64_t now) {
     carry = carry > 0.5 ? 0.5 : carry < -0.5 ? -0.5 : carry;
     *slot = fps;
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
+}
+/* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
+   Uses the existing frame ID/clock; a forced stop can lose the last second of buffered present records. */
+static void present_trace(int64_t frame, int64_t now) {
+    static FILE *file;
+    static char buffer[64 * 1024];
+    static int looked;
+    static int64_t last, flushed;
+    if (!looked) {
+        const char *path = getenv("HOS_PRESENT_TRACE");
+        looked = 1;
+        if (path && *path) {
+            file = fopen(path, "w");
+            if (!file) hos_log("vi: could not open present trace %s", path);
+        }
+        if (file) {
+            setvbuf(file, buffer, _IOFBF, sizeof buffer);
+            fputs("frame,return_ns,interval_ns\n", file);
+            flushed = now;
+        }
+    }
+    if (!file) return;
+    fprintf(file, "%lld,%lld,%lld\n", (long long)frame, (long long)now, (long long)(frame > 1 ? now - last : 0));
+    last = now;
+    if (now - flushed >= 1000000000LL) {
+        fflush(file);
+        flushed = now;
+    }
 }
 void hos_vi_native_presented(void) {
     static long long scan_n;
@@ -259,6 +331,7 @@ void hos_vi_native_presented(void) {
         shown_count = n + 1;
     }
     const int64_t n = InterlockedIncrement64(&presents);
+    present_trace(n, now);
     {   /* HOS_MKW_INTERVAL=<0|1|2>: the interval MKW's pacer is held at, through its own override (+0x210, any
            non-zero value is used as the interval): 1 (the default): a steady 60 fps; 2: 30; 0: the game's choice,
            which with frames between 16.7 and 33 ms swings between the two (25-27 fps, stutters). Its timing counts
