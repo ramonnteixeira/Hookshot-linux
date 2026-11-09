@@ -4843,10 +4843,41 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     return true;
 }
 
+// (fork, linux-port) The mesh programs whose fallback the driver's compiler faulted on, kept across starts in
+// hookshot_bad_fallback.txt beside the game (one key in hex a line). On an MX250 (Pascal, NVIDIA on Linux) the compiler faults
+// on the fallback of OoT's mesh a5da9f84b72d1471 at the cut to the Deku Tree; the guard (guarded_compute) gets the thread out of
+// the driver with siglongjmp, but whatever the driver held then stays held, and the next compile of that program (the next
+// draw) never returned: the presentation thread stopped and the screen stayed black. So a program that failed once is never
+// compiled again (its draws left out, the rest of the frame drawn), and from the next start not even once, so the driver
+// never faults at all. Deleting the file tries them again (a new driver); RX_VK_BAD_FALLBACK_KEEP=1 neither reads nor writes it
+std::string bad_fallback_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_bad_fallback.txt";
+}
+std::unordered_set<uint64_t>& bad_fallback() {   // (under fallback_compute_pipelines' lock)
+    static std::unordered_set<uint64_t> keys = [] {
+        std::unordered_set<uint64_t> k;
+        if (getenv("RX_VK_BAD_FALLBACK_KEEP")) return k;
+        if (FILE* f = fopen(bad_fallback_path().c_str(), "r")) {
+            char line[64];
+            while (fgets(line, sizeof line, f))
+                if (const uint64_t v = strtoull(line, nullptr, 16)) k.insert(v);
+            fclose(f);
+        }
+        if (!k.empty()) logf("vk: fallback: %zu mesh programs left out without compiling (hookshot_bad_fallback.txt)", k.size());
+        return k;
+    }();
+    return keys;
+}
+
 bool fallback_compute_pipelines(Program& p) {
     static std::mutex mu;
     std::lock_guard lk(mu);
     if (!p.fallback_compute.empty()) return true;
+    static std::unordered_set<uint64_t> failed;   // (this start's, of any cause: not tried again draw after draw)
+    if (failed.count(p.key) || bad_fallback().count(p.key)) return false;
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -4861,9 +4892,20 @@ bool fallback_compute_pipelines(Program& p) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
         ci.layout = p.layout;
-        if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {
+        if (const VkResult r = guarded_compute(pcache, &ci, &made[i]); r != VK_SUCCESS) {
             static std::atomic<int> told{0};
             if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
+            failed.insert(p.key);
+            for (VkPipeline& m : made)
+                if (m) vkDestroyPipeline(dev.device, m, nullptr), m = VK_NULL_HANDLE;
+            if (r == (VkResult)-77 && !getenv("RX_VK_BAD_FALLBACK_KEEP") && bad_fallback().insert(p.key).second) {
+                if (FILE* f = fopen(bad_fallback_path().c_str(), "a")) {
+                    fprintf(f, "%016llx\n", (unsigned long long)p.key);
+                    fclose(f);
+                }
+                logf("vk: fallback: %016llx noted in hookshot_bad_fallback.txt: left out from the next start without compiling "
+                     "(if the game stops here, start it again)", (unsigned long long)p.key);
+            }
             return false;
         }
         pcache_built_since_save++;
