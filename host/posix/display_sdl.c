@@ -22,6 +22,7 @@
 
 int rx_start(void *hwnd);
 void rx_resize(int width, int height);
+void rx_close_asked(void);
 void hos_sdl_pads_pump(void);   /* host/pad_sdl.c: controllers, on this thread, as SDL's queue wants */
 
 volatile LONG64 hos_present_count;   /* (nvn_native.c: the game's presents) */
@@ -245,6 +246,7 @@ void hos_display_loop(void) {
                 switch (e.type) {
                 case HOS_SDL_EV_QUIT:
                 case HOS_SDL_EV_CLOSE:
+                    rx_close_asked();   /* (a start still preparing the shaders keeps what it made) */
                     hos_log("display: window closed, exiting");
                     hos_log_flush();
                     ExitProcess(0);

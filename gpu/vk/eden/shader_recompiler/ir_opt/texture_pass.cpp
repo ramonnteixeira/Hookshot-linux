@@ -1283,7 +1283,12 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             }
             const bool is_written{inst->GetOpcode() != IR::Opcode::ImageRead};
             const bool is_read{inst->GetOpcode() != IR::Opcode::ImageWrite};
-            const bool is_integer{is_texture_pixel_format_integer(cbuf)};
+            const bool is_integer{flags.image_format == ImageFormat::R8_UINT ||
+                                  flags.image_format == ImageFormat::R16_UINT ||
+                                  flags.image_format == ImageFormat::R32_UINT ||
+                                  flags.image_format == ImageFormat::R32G32_UINT ||
+                                  flags.image_format == ImageFormat::R32G32B32A32_UINT ||
+                                  is_texture_pixel_format_integer(cbuf)};
             if (flags.type == TextureType::Buffer) {
                 index = descriptors.Add(ImageBufferDescriptor{
                     .format = flags.image_format,

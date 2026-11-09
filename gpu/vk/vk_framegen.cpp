@@ -28,6 +28,10 @@
 #include "shaders/fg_synth_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   // (older Windows SDKs lack it: Windows 10 1803 and later take it)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 namespace mkwvk {
 extern std::atomic<uint32_t> present_kind;   // (vk_replay.cpp: the frame log's)
 namespace {
@@ -214,8 +218,10 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
     }
-    queue_flush();
-    vkDeviceWaitIdle(dev.device);
+    {
+        std::lock_guard qk(dev.present_mu);   // (every queue idle: the present queue's too, device_wait_idle_locked)
+        device_wait_idle_locked();
+    }
     for (int i = 0; i < 2; i++) {
         drop_img(fg.frames[i]), drop_img(fg.lumas[i]), drop_img(fg.flows[i]);
     }
@@ -272,6 +278,20 @@ void pass(VkCommandBuffer cmd, const Pipe& p, std::initializer_list<std::pair<Vk
     full_barrier(cmd);
 }
 
+// (hookshot) The display thread's wait for a frame's time, on a high-resolution timer. sleep_for rests on the system timer,
+// whose 1 ms (timeBeginPeriod) Windows 11 does not keep for a process whose window it takes as unseen: with the presents
+// no longer blocking (a present queue of their own) the thread slept before most frames and woke up to 20 ms after their time.
+void wait_until_near(int64_t ns) {
+    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    LARGE_INTEGER d;
+    d.QuadPart = -std::max<int64_t>(1, ns / 100);   // (relative, 100 ns units)
+    if (timer && SetWaitableTimerEx(timer, &d, 0, nullptr, nullptr, nullptr, 0)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::nanoseconds(ns));
+}
+
 void display_main() {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk display");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
@@ -311,9 +331,7 @@ void display_main() {
             const int64_t now = now_ns();
             if (due < now) due = now;
             if (due > j.at + interval + step) due = j.at + interval + step;
-            if (due - now > 1000000) {
-                std::this_thread::sleep_for(std::chrono::nanoseconds(due - now - 1000000));
-            }
+            if (due - now > 1000000) wait_until_near(due - now - 1000000);
             while (now_ns() < due) SwitchToThread();
             const int64_t t = now_ns();
             present_kind.store(k < j.set->made ? 1 : 0);
@@ -360,8 +378,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         if (scale.cropped_w != cw || scale.cropped_h != ch) {
             {
                 std::lock_guard qk(dev.present_mu);
-                queue_flush_locked();
-                vkDeviceWaitIdle(dev.device);
+                device_wait_idle_locked();
             }
             drop_img(scale.cropped);
             scale.cropped_w = scale.cropped_h = 0;
@@ -384,8 +401,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     if (scale.scaled_w != dw || scale.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
-            queue_flush_locked();
-            vkDeviceWaitIdle(dev.device);
+            device_wait_idle_locked();
         }
         drop_img(scale.scaled);
         scale.scaled_w = scale.scaled_h = 0;

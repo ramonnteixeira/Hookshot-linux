@@ -78,9 +78,14 @@ def play(folder):
 
 
 def desktop_exec(path):
-    """One Exec argument. A % in the path is a field code, so "100% Games" is rejected and the menu entry does not run."""
-    escaped = path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    return '"%s"' % escaped
+    """One Exec argument. A % in the path is a field code, so "100% Games" is rejected and the menu entry does not run.
+    Inside the quotes the Desktop Entry spec wants the characters double quote, backtick, dollar and backslash each
+    preceded by a backslash, and every backslash written twice because the file's string escaping is applied first
+    (so a literal backslash is four, and a dollar is two backslashes and the dollar)."""
+    escaped = path.replace("\\", "\\\\\\\\")
+    for char in ('"', "`", "$"):
+        escaped = escaped.replace(char, "\\\\" + char)
+    return '"%s"' % escaped.replace("%", "%%")
 
 
 APP_ID = "io.github.NotRexed.Hookshot"   # (the game's window names itself so: host/posix/display_sdl.c's HOS_APP_ID)
@@ -101,6 +106,7 @@ def add_to_menu(folder):
 
 
 def free_gb(path):
+    path = os.path.expanduser(path or "")   # (the field takes ~/Games/Hookshot, as build() and apply_mode() read it)
     while path and not os.path.exists(path):
         path = os.path.dirname(path)
     try:
@@ -386,7 +392,7 @@ class Builder(tk.Tk):
                     root = linux_update.running_root()
                     if root is None:
                         raise RuntimeError("These tools are a source checkout, so they cannot download a release. Start the AppImage to update.")
-                    manifest = linux_update.fetch_manifest()
+                    manifest = linux_update.startup_manifest(root)
                     if manifest.tag != linux_update.tools_tag(root):
                         source = linux_update.read_manifest(root)
                         apprun = linux_update.install(manifest, root, source, note=lambda message: self.lines.put(("note", message)))

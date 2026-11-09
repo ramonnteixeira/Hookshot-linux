@@ -118,6 +118,9 @@ def main():
     markers += ['uint64_t answers_hash(', 'void record_answers(', 'bool still_valid(',
                 'void answer_handles(', 'uint32_t answer_stage_mask(']
     functions = '\n\n'.join(block(source, marker) for marker in markers)
+    if 'if (answers_in)' in functions:
+        start = source.rfind('\n', 0, source.index(' answers_in =')) + 1
+        functions = source[start:source.index(';', start) + 1] + '\n\n' + functions
     fixture = FIXTURE.replace('#include MATCHER_FUNCTIONS', functions)
     flags = ['-std=c++20', '-O1', '-w', '-DNDEBUG', '-DVK_NO_PROTOTYPES', '-DMKWVK_INCLUDES=2']
     for header in ('algorithm', 'cstdio', 'cstdlib', 'cstring', 'functional', 'string', 'vector'):

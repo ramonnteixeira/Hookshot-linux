@@ -138,6 +138,7 @@ static CONDITION_VARIABLE log_cv = CONDITION_VARIABLE_INIT;
 static char *log_q[2048];
 static int log_head, log_count;
 static volatile LONG log_async = -1;
+static volatile DWORD log_writer;   /* log_main's thread */
 
 static int log_take_locked(char **out) {
     int n = 0;
@@ -160,6 +161,7 @@ static void log_write(char **lines, int n) {
 static DWORD WINAPI log_main(void *p) {
     (void)p;
     static char *batch[2048];
+    log_writer = GetCurrentThreadId();
     for (;;) {
         AcquireSRWLockExclusive(&log_lock);
         while (!log_count) SleepConditionVariableSRW(&log_cv, &log_lock, INFINITE, 0);
@@ -171,8 +173,24 @@ static DWORD WINAPI log_main(void *p) {
     }
 }
 
+/* the queued lines straight to the handle (crash paths: no CRT stream, no write lock) */
+static void log_drain_raw(void) {
+    if (!TryAcquireSRWLockExclusive(&log_lock)) return;
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    while (log_count) {
+        const char *line = log_q[log_head];
+        DWORD written;
+        WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
+        log_head = (log_head + 1) % 2048;
+        log_count--;
+    }
+    ReleaseSRWLockExclusive(&log_lock);
+}
+
 static void log_flush(void) {
     if (log_async <= 0) return;
+    /* (a crash report on the writer itself, in its own write: it holds log_write_lock) */
+    if (GetCurrentThreadId() == log_writer) { log_drain_raw(); return; }
     static char *batch[2048];
     AcquireSRWLockExclusive(&log_write_lock);
     AcquireSRWLockExclusive(&log_lock);
@@ -185,31 +203,31 @@ static void log_flush(void) {
 static LPTOP_LEVEL_EXCEPTION_FILTER log_prev_filter;
 
 static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *e) {
-    if (TryAcquireSRWLockExclusive(&log_write_lock)) {
-        if (TryAcquireSRWLockExclusive(&log_lock)) {
-            HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-            while (log_count) {
-                const char *line = log_q[log_head];
-                DWORD written;
-                WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
-                log_head = (log_head + 1) % 2048;
-                log_count--;
-            }
-            ReleaseSRWLockExclusive(&log_lock);
-        }
-        ReleaseSRWLockExclusive(&log_write_lock);
+    if (GetCurrentThreadId() == log_writer) log_drain_raw();
+    else {
+        /* the writer may be in the middle of a batch: it finishes first (at most 2 s: a write stuck on the disk), then the
+           rest of the queue goes out (before: the queue was left unwritten whenever the writer was busy) */
+        int got = 0;
+        for (int i = 0; i < 2000 && !(got = TryAcquireSRWLockExclusive(&log_write_lock)); i++) Sleep(1);
+        log_drain_raw();
+        if (got) ReleaseSRWLockExclusive(&log_write_lock);
     }
     return log_prev_filter ? log_prev_filter(e) : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Lines are written by log_main, not by the thread that logs: a write that blocks (a console; the log file while the
+   disk is busy: the render thread was seen held 140-310 ms in one line's write) holds no game thread. Nothing queued is
+   lost when the game ends or crashes: hos_fatal, report_crash/report_fatal (mkw_glue.c), log_crash_filter,
+   svcExitProcess, the window's close and the process's exit (atexit) write the queue first. HOS_LOG_SYNC=1: each line
+   written by the thread that logs it, as files and pipes were before */
 static int log_queue(const char *line) {
     if (log_async < 0) {
         AcquireSRWLockExclusive(&log_lock);
         if (log_async < 0) {
-            DWORD mode;
-            int on = !getenv("HOS_LOG_SYNC") && GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode);
+            int on = !getenv("HOS_LOG_SYNC");
             if (on && !CreateThread(NULL, 0, log_main, NULL, 0, NULL)) on = 0;
             if (on) log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
+            if (on) atexit(log_flush);
             log_async = on;
         }
         ReleaseSRWLockExclusive(&log_lock);
@@ -560,12 +578,33 @@ uint64_t hos_reserved_cpus(void) {
     return mask;
 }
 
+/* (hookshot) The game's render thread on the reserved core itself: in the default synchronous mode (RX_VK_ASYNC unset) the
+   Vulkan back end replays a submission on the thread that submits it, and OoT's "Presentation Thread" submits most of each
+   frame's (4 of its 6 queues). The core kept for the replay thread had nothing on it then. On a Ryzen 9 3900X in Kokiri
+   Forest: the replay ~24 -> ~22 ms a frame, 34 -> 36 fps (2026-11-08). HOS_PIN_RENDER=0: kept off the core as before */
+static int render_thread_on_reserved(const char *name) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_PIN_RENDER"), *async = getenv("RX_VK_ASYNC");
+        on = (!e || atoi(e) != 0) && !(async && atoi(async) != 0);
+    }
+    return on && name && strcmp(name, "Presentation Thread") == 0;
+}
+
 void hos_thread_pin(void *h, const char *name) {
     const uint64_t reserved = hos_reserved_cpus();
     if (reserved) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        if (render_thread_on_reserved(name) && ((uint64_t)proc & reserved)) {
+            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & reserved));
+            static volatile LONG told;
+            if (!InterlockedExchange(&told, 1))
+                hos_log("threads: %s on the reserved core (logical processors %#llx; HOS_PIN_RENDER=0: off)", name,
+                        (unsigned long long)((uint64_t)proc & reserved));
+        } else if ((uint64_t)proc & ~reserved) {
+            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        }
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;

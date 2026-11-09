@@ -79,7 +79,7 @@ class ShaderStampCacheTests(unittest.TestCase):
             "spirv_headers": str(self.root / "deps/spirv-headers"),
             "vk_headers": str(self.root / "deps/vulkanheaders"),
             "obj_dir": str(self.root / "obj"), "cc": "clang", "jobs": [],
-            "stamp_def": '-DHOOKSHOT_VERSION="%s"' % version,
+            "stamp_def": '-DHOOKSHOT_VERSION="%s"' % version, "logo_text": b"", "gen_dir": str(self.root / "gen"),
         }
         with mock.patch.dict(os.environ, {"RX_RELEASE": "1"} if release else {}, clear=True), warnings.catch_warnings():
             # The production key/header helpers use short-lived open(...).read() expressions.

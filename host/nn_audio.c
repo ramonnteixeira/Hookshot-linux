@@ -6,13 +6,15 @@
      voices (PCM16, PCM float, DSP-ADPCM; resampled by sample rate x pitch, voice volume)
        -> their destination mix or splitter (per channel pair volumes)
        -> sub mixes in dependency order (sub mix volume, then to their destination)
-       -> the final mix (volume) -> the device sink (its channel map, down to stereo) -> waveOut
+       -> the final mix (volume) -> the device sink (its channel map: 5.1 as it is to a 5.1 device, else down to stereo)
+       -> waveOut
    and signals the renderer event the game's audio thread waits on. Effects are accepted and left out (dry signal);
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
    HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
-   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs). */
+   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs);
+   HOS_AUDIO_CHANNELS=2 or 6: stereo or 5.1 whatever the default output has (see au_speakers). */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
@@ -21,6 +23,14 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#ifdef _WIN32
+#include <mmreg.h>
+#include <objbase.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#else
+#include "hos_sdl.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);
 void hos_system_event_signal(uint64_t key);
@@ -439,7 +449,7 @@ static int mix_depth(int i, int guard) {   /* how many sub mixes lie between thi
     return 1 + mix_depth(mixes[i].dest, guard + 1);
 }
 
-static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
+static void render_frame(int16_t *pcm, int channels) {   /* 240 frames of the device's 2 or 6 channels */
     for (int m = 0; m < MAX_MIXES; m++)
         if (mixes[m].used) {
             const int rows = mixes[m].buffers < 0 ? 0 : mixes[m].buffers > MAX_BUF ? MAX_BUF : mixes[m].buffers;
@@ -470,8 +480,11 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
                 for (int i = 0; i < FRAME; i++) d->buf[dst][i] += s->buf[src][i] * g;
             }
     }
-    /* the final mix through the sink's channel map: FL FR FC LFE RL RR, down to stereo */
-    float l[FRAME] = {0}, r[FRAME] = {0};
+    /* the final mix through the sink's channel map: FL FR FC LFE RL RR, as it is to a 5.1 device (the same order on
+       Windows' and SDL's 5.1), else down to stereo */
+    const int six = channels == 6;
+    float out[6][FRAME];
+    memset(out, 0, sizeof out);
     if (sink_mix >= 0 && mixes[sink_mix].used) {
         effects_frame(sink_mix);
         Mix *f = &mixes[sink_mix];
@@ -479,14 +492,19 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
         for (int k = 0; k < sink_n && k < 6; k++) {
             const int b = sink_in[k];
             if (b < 0 || b >= f->buffers) continue;
+            if (six) {
+                for (int i = 0; i < FRAME; i++) out[k][i] += f->buf[b][i] * g;
+                continue;
+            }
             const float gl = k == 0 ? 1.0f : k == 1 ? 0.0f : k == 2 ? 0.7071f : k == 4 ? 0.7071f : k == 3 ? 0.5f : 0.0f;
             const float gr = k == 1 ? 1.0f : k == 0 ? 0.0f : k == 2 ? 0.7071f : k == 5 ? 0.7071f : k == 3 ? 0.5f : 0.0f;
             for (int i = 0; i < FRAME; i++) {
-                l[i] += f->buf[b][i] * g * gl;
-                r[i] += f->buf[b][i] * g * gr;
+                out[0][i] += f->buf[b][i] * g * gl;
+                out[1][i] += f->buf[b][i] * g * gr;
             }
         }
     }
+    const int nch = six ? 6 : 2;
     {   /* HOS_AUDIO_STATS=1: once a second, what plays and where the signal is */
         static int stats = -1, frames;
         if (stats < 0) stats = getenv("HOS_AUDIO_STATS") != NULL;
@@ -543,25 +561,23 @@ static void render_frame(int16_t *pcm) {   /* 240 stereo frames */
             }
         }
     }
-    if (lim_enabled)   /* fast attack, ~50 ms release */
+    if (lim_enabled)   /* fast attack, ~50 ms release (one gain for every channel, so the picture does not move) */
         for (int i = 0; i < FRAME; i++) {
-            const float x = fmaxf(fabsf(l[i]), fabsf(r[i])) * lim_in;
+            float x = 0;
+            for (int ch = 0; ch < nch; ch++) x = fmaxf(x, fabsf(out[ch][i]));
+            x *= lim_in;
             const float want = x > lim_threshold ? lim_threshold / x : 1.0f;
             lim_env = want < lim_env ? want : lim_env + (want - lim_env) * 0.0004f;
-            l[i] *= lim_in * lim_env * lim_out;
-            r[i] *= lim_in * lim_env * lim_out;
+            for (int ch = 0; ch < nch; ch++) out[ch][i] *= lim_in * lim_env * lim_out;
         }
-    for (int i = 0; i < FRAME; i++) {
-        float a = l[i] * 32767.0f, b = r[i] * 32767.0f;
-        if (a != a) a = 0;   /* (NaN) */
-        if (b != b) b = 0;
-        if (a > 32767) a = 32767;
-        if (a < -32768) a = -32768;
-        if (b > 32767) b = 32767;
-        if (b < -32768) b = -32768;
-        pcm[i * 2] = (int16_t)a;
-        pcm[i * 2 + 1] = (int16_t)b;
-    }
+    for (int i = 0; i < FRAME; i++)
+        for (int ch = 0; ch < nch; ch++) {
+            float a = out[ch][i] * 32767.0f;
+            if (a != a) a = 0;   /* (NaN) */
+            if (a > 32767) a = 32767;
+            if (a < -32768) a = -32768;
+            pcm[i * nch + ch] = (int16_t)a;
+        }
 }
 
 /* (the output's platform parts, outside the section tests/audio_output_errors_test.c compiles with its own) */
@@ -588,13 +604,91 @@ static void au_opened(HWAVEOUT w) {
     (void)w;
 #endif
 }
+/* The default output's channels (its shared-mode mix format on Windows, SDL's default device on Linux); 2 when
+   unknown. */
+#ifdef _WIN32
+static int au_device_channels(void) {
+    static const GUID clsid_enumerator = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
+    static const GUID iid_enumerator = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
+    static const GUID iid_audio_client = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
+    int n = 2;
+    const HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* (a thread in another apartment keeps it) */
+    IMMDeviceEnumerator *e = NULL;
+    if (SUCCEEDED(CoCreateInstance(&clsid_enumerator, NULL, CLSCTX_ALL, &iid_enumerator, (void **)&e)) && e) {
+        IMMDevice *d = NULL;
+        if (SUCCEEDED(e->lpVtbl->GetDefaultAudioEndpoint(e, eRender, eConsole, &d)) && d) {
+            IAudioClient *a = NULL;
+            if (SUCCEEDED(d->lpVtbl->Activate(d, &iid_audio_client, CLSCTX_ALL, NULL, (void **)&a)) && a) {
+                WAVEFORMATEX *mix = NULL;
+                if (SUCCEEDED(a->lpVtbl->GetMixFormat(a, &mix)) && mix) {
+                    n = mix->nChannels;
+                    CoTaskMemFree(mix);
+                }
+                a->lpVtbl->Release(a);
+            }
+            d->lpVtbl->Release(d);
+        }
+        e->lpVtbl->Release(e);
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+    return n;
+}
+#else
+static int au_device_channels(void) { return hos_sdl_audio_channels(); }
+#endif
+/* The speakers the game mixes for: 6 when the default output has 5.1 or more, else 2 (HOS_AUDIO_CHANNELS=2 or 6 to
+   choose). The game asks once, at its start (GetActiveAudioDeviceChannelCountForOutput), and pans for that many. Told 2
+   (always, before), it put nothing behind the player, and a 5.1 system played the whole game from the front speakers
+   (issue 1124). Its device sink has the six channels either way; with two speakers they are mixed down. */
+static int au_speakers(void) {
+    static volatile int known;
+    if (!known) {
+        au_lock();   /* (the game's thread and the mixer's ask at about the same time: one of them looks) */
+        if (!known) {
+            const char *want = getenv("HOS_AUDIO_CHANNELS");
+            int n;
+            if (want && *want) {
+                n = atoi(want) >= 6 ? 6 : 2;
+                hos_log("audio: %s for the game (HOS_AUDIO_CHANNELS)", n == 6 ? "5.1" : "stereo");
+            } else {
+                const int device = au_device_channels();
+                n = device >= 6 ? 6 : 2;
+                hos_log("audio: %s for the game (the default output has %d channels)", n == 6 ? "5.1" : "stereo", device);
+            }
+            known = n;
+        }
+        au_unlock();
+    }
+    return known;
+}
+/* The device's format, 16-bit PCM at 48 kHz: Windows takes more than two channels only as WAVE_FORMAT_EXTENSIBLE,
+   with the speakers named (5.1: FL FR FC LFE BL BR, the device sink's order). SDL takes the channel count as it is. */
+static const WAVEFORMATEX *au_format(const WAVEFORMATEX *f) {
+#ifdef _WIN32
+    if (f->nChannels <= 2) return f;
+    static const GUID pcm = {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+    static WAVEFORMATEXTENSIBLE x;
+    memset(&x, 0, sizeof x);
+    x.Format = *f;
+    x.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    x.Format.cbSize = sizeof x - sizeof x.Format;
+    x.Samples.wValidBitsPerSample = f->wBitsPerSample;
+    x.dwChannelMask = 0x3F;   /* front left, right, centre, low frequency, back left, right */
+    x.SubFormat = pcm;        /* (KSDATAFORMAT_SUBTYPE_PCM) */
+    return &x.Format;
+#else
+    return f;
+#endif
+}
 
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
+#define OUT_MAX_CH 6
 static HWAVEOUT wout;
 static WAVEHDR hdr[NBLOCKS];
-static int16_t blocks[NBLOCKS][FRAME * 2 * 2];
+static int16_t blocks[NBLOCKS][FRAME * 2 * OUT_MAX_CH];
 static int fill_block, fill_frames;
+static int out_channels = 2;   /* the device's (and the dump's): 2, or 6 for 5.1 */
 static FILE *dump;
 static uint32_t dump_bytes;
 
@@ -620,7 +714,7 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
         if (!want || !*want) return 0;
         device = (unsigned)atoi(want);
     } else device = candidate == 1 ? WAVE_MAPPER : (unsigned)(candidate - 2);
-    const MMRESULT result = waveOutOpen(&wout, device, f, 0, 0, CALLBACK_NULL);
+    const MMRESULT result = waveOutOpen(&wout, device, au_format(f), 0, 0, CALLBACK_NULL);
     if (result != MMSYSERR_NOERROR) {
         output_error("waveOutOpen", result);
         wout = NULL;
@@ -630,36 +724,49 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
     char name[64];
     if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
     else au_device_name(device, name, sizeof name);
-    hos_log("audio: output on %s (%u devices)", name, au_device_count());
+    hos_log("audio: output on %s (%u devices), %s", name, au_device_count(), f->nChannels == 6 ? "5.1" : "stereo");
     return 1;
 }
+/* The channels: the game's speakers (au_speakers). A 5.1 format no device takes is stereo instead: the device sink's
+   six channels are then mixed down, nothing is lost. */
 static void output_open(void) {
     static int dump_done;
-    const char *d = getenv("HOS_AUDIO_DUMP");
-    if (!dump_done && d && (dump = fopen(d, "wb")) != NULL) {
-        static const uint8_t z[44];
-        fwrite(z, 1, 44, dump);
+    int channels = au_speakers();
+    if (!dump_done) {
+        const char *d = getenv("HOS_AUDIO_DUMP");
+        if (d && (dump = fopen(d, "wb")) != NULL) {
+            static const uint8_t z[44];
+            fwrite(z, 1, 44, dump);
+        }
+        out_channels = channels;
+        dump_done = 1;
     }
-    dump_done = 1;
     if (getenv("HOS_AUDIO") && atoi(getenv("HOS_AUDIO")) == 0) return;
-    WAVEFORMATEX f = {0};
-    f.wFormatTag = WAVE_FORMAT_PCM;
-    f.nChannels = 2;
-    f.nSamplesPerSec = RATE;
-    f.wBitsPerSample = 16;
-    f.nBlockAlign = 4;
-    f.nAvgBytesPerSec = RATE * 4;
-    const int candidates = 2 + (int)au_device_count();
-    for (int tried = 0; tried < candidates && !wout; tried++) {
-        const int c = out_next;
-        out_next = (out_next + 1) % candidates;
-        output_try(c, &f);
+    if (dump) channels = out_channels;   /* (a dump keeps one layout: no stereo fallback) */
+    for (;;) {
+        WAVEFORMATEX f = {0};
+        f.wFormatTag = WAVE_FORMAT_PCM;
+        f.nChannels = channels;
+        f.nSamplesPerSec = RATE;
+        f.wBitsPerSample = 16;
+        f.nBlockAlign = 2 * channels;
+        f.nAvgBytesPerSec = RATE * 2 * channels;
+        const int candidates = 2 + (int)au_device_count();
+        for (int tried = 0; tried < candidates && !wout; tried++) {
+            const int c = out_next;
+            out_next = (out_next + 1) % candidates;
+            output_try(c, &f);
+        }
+        if (wout || channels == 2 || dump) break;
+        hos_log("audio: no device took 5.1: stereo instead");
+        channels = 2;
     }
+    out_channels = channels;
     if (!wout) return;
     for (int i = 0; i < NBLOCKS; i++) {
         memset(&hdr[i], 0, sizeof hdr[i]);
         hdr[i].lpData = (LPSTR)blocks[i];
-        hdr[i].dwBufferLength = sizeof blocks[i];
+        hdr[i].dwBufferLength = FRAME * 2 * channels * sizeof blocks[0][0];   /* (two frames) */
         hdr[i].dwFlags = WHDR_DONE;
     }
     fill_block = fill_frames = 0;
@@ -683,8 +790,8 @@ static void dump_finish(void) {
     if (!dump) return;
     uint8_t h[44];
     memcpy(h, "RIFF", 4);
-    const uint32_t riff = 36 + dump_bytes, fmt = 16, rate = RATE, brate = RATE * 4, data = dump_bytes;
-    const uint16_t pcm = 1, ch = 2, align = 4, bits = 16;
+    const uint16_t pcm = 1, ch = (uint16_t)out_channels, align = (uint16_t)(2 * out_channels), bits = 16;
+    const uint32_t riff = 36 + dump_bytes, fmt = 16, rate = RATE, brate = RATE * align, data = dump_bytes;
     memcpy(h + 4, &riff, 4);
     memcpy(h + 8, "WAVEfmt ", 8);
     memcpy(h + 16, &fmt, 4);
@@ -702,8 +809,8 @@ static void dump_finish(void) {
 }
 static void output_frame(const int16_t *pcm) {
     if (dump) {
-        fwrite(pcm, 4, FRAME, dump);
-        dump_bytes += FRAME * 4;
+        fwrite(pcm, (size_t)(2 * out_channels), FRAME, dump);
+        dump_bytes += (uint32_t)(FRAME * 2 * out_channels);
         static int n;
         if (++n % 200 == 0) {   /* (the header kept valid every second: the process may end without notice) */
             const long at = ftell(dump);
@@ -712,7 +819,7 @@ static void output_frame(const int16_t *pcm) {
         }
     }
     if (!wout) return;
-    for (int i = 0; i < FRAME * 2; i++) {
+    for (int i = 0; i < FRAME * out_channels; i++) {
         const unsigned a = (unsigned)(pcm[i] < 0 ? -pcm[i] : pcm[i]);
         if (a > out_peak) out_peak = a;
     }
@@ -738,7 +845,7 @@ static void output_frame(const int16_t *pcm) {
             }
         }
     }
-    memcpy(blocks[fill_block] + fill_frames * FRAME * 2, pcm, FRAME * 4);
+    memcpy(blocks[fill_block] + fill_frames * FRAME * out_channels, pcm, (size_t)(FRAME * 2 * out_channels));
     if (++fill_frames == 2) {
         h->dwFlags = 0;
         const char *operation = "waveOutPrepareHeader";
@@ -900,14 +1007,14 @@ static DWORD WINAPI renderer_main(void *p) {
     hos_thread_boost(2);
     output_open();
     int64_t period = 5000000, next = hos_now_ns() + period;   /* one audio frame: 240 samples at 48 kHz */
-    static int16_t pcm[FRAME * 2];
+    static int16_t pcm[FRAME * OUT_MAX_CH];
     for (;;) {
         hos_sleep_ns(next - hos_now_ns());
         next = audio_mix_deadline(hos_now_ns(), next, period);
         if (!renderer_running) continue;
         au_lock();
         if (ncmds && hos_now_ns() - last_update_ns > 50000000) commit();   /* (no update came: see "parameter updates") */
-        render_frame(pcm);
+        render_frame(pcm, out_channels);
         au_unlock();
         output_frame(pcm);
         elapsed_frames++;
@@ -970,9 +1077,10 @@ HLE(_ZN2nn5audio29InitializeAudioRendererConfigEPNS0_19AudioRendererConfigERKNS0
     put_handle(ARG(0), K_CONFIG, 0);
 }
 
-/* The output device: one stereo device, "MainAudioOut". AudioDeviceName is char[256]. */
+/* The output device: one device, "MainAudioOut", stereo or 5.1 as the PC's default output (au_speakers).
+   AudioDeviceName is char[256]. */
 HLE(_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11SystemEventE) { hos_system_event_init(ARG(0), 1); }
-HLE(_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv) { RET(2); }
+HLE(_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv) { RET(au_speakers()); }
 HLE(_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE) {
     memset(GP(ARG(0)), 0, 256);
     memcpy(GP(ARG(0)), "MainAudioOut", 12);

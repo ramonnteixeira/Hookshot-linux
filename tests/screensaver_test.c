@@ -80,6 +80,7 @@ static BOOL ValidateRect(HWND w, const RECT *rect) { (void)w; (void)rect; unexpe
 static void hos_log(const char *text) { (void)text; unexpected(); }
 static void hos_log_flush(void) { unexpected(); }
 static void ExitProcess(unsigned code) { (void)code; unexpected(); }
+static void rx_close_asked(void) { unexpected(); }   /* (host/rx_backend.c: WM_CLOSE, not one of the checked messages) */
 void hos_vk_note_key_press(unsigned key) { (void)key; }   /* (host/rx_backend.c: the menu notes key presses; nothing here) */
 
 /* (PR 946: the Insert menu takes the mouse while it is open; these branches never run here either) */

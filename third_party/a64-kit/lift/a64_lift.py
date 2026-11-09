@@ -602,34 +602,85 @@ static inline __attribute__((always_inline)) void a64_vfpx_mul32(Ctx *c, uint64_
 
 
 # Results past the fast path's range once their flags are already raised (TOTK's threads: FPSR = 0x9f, every cumulative
-# flag set; FPCR.FZ = 1). Overflow (OFC raised): an infinite result of finite operands is the native one, the
-# round-to-nearest ±inf (~1M multiplies a second at the castle went through the exact body for it). Flush-to-zero (UFC
-# raised): a result below the normal range is the native one flushed to a zero of its sign. Sums are exact there (a
-# tiny sum of normal numbers is a subnormal exactly), products flush when the exact product is tiny, which the native
-# result shows unless it rounded up to the smallest normal (then the exact body decides). No subnormal operand (those
-# flush first).
+# flag set; FPCR.FZ = 1). FADD/FSUB S (a64_fpx_fz_add32 / a64_fpx_fz_sub32, OFC or UFC raised): an infinite result of
+# finite operands is the native one, the round-to-nearest ±inf (~1M multiplies a second at the castle went through the
+# exact body for it); under FZ with UFC raised a result below the normal range is the native one flushed to a zero of its
+# sign. Sums are exact there (a tiny sum of normal numbers is a subnormal exactly). No subnormal operand (those flush
+# first). FMUL/FNMUL/FMLA-family S: a64_fpx_sticky32 below.
 FPX_FZ_HEADER = r"""
-#define A64_FPX_FZ_OPEN(c) (RECOMP_FPX_OPEN(c) && ((c)->fpsr & 0xCu))
-static inline __attribute__((always_inline)) int a64_fpx_fz_result(const Ctx *c, uint64_t a, uint64_t b, uint64_t t, int mul, uint64_t *v) {
+static inline __attribute__((always_inline)) int a64_fpx_fz_result(const Ctx *c, uint64_t a, uint64_t b, uint64_t t, uint64_t *v) {
     const uint32_t m = (uint32_t)t & 0x7fffffffu;
     if (m == 0x7f800000u) return (c->fpsr & 4u) && RECOMP_FPX_FIN32(a) && RECOMP_FPX_FIN32(b) ? (*v = t, 1) : 0;
     if (!RECOMP_FPX_FZ(c) || !(c->fpsr & 8u) || m > 0x7f800000u || RECOMP_FPX_SUBN32(a) || RECOMP_FPX_SUBN32(b)) return 0;
-    if (m >= 0x00800000u) return (mul && m == 0x00800000u) ? 0 : (*v = t, 1);
+    if (m >= 0x00800000u) return (*v = t, 1);
     *v = t & 0x80000000u;
     return 1;
 }
 #if RECOMP_FPX_HOST
 static inline __attribute__((always_inline)) int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b)), 0, v); }
+    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) + recomp_fpx_f(b)), v); }
 static inline __attribute__((always_inline)) int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b)), 0, v); }
-static inline __attribute__((always_inline)) int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
-    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) * recomp_fpx_f(b)), 1, v); }
+    return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b)), v); }
 #else
 static inline int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
 static inline int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
-static inline int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
 #endif
+/* FMUL/FNMUL/FMLA-family S past the fast path (the "sticky" rescue of the outlined wrappers a64_fpx_mul32_fma32 and
+   a64_fpx_fma32_fma32, inside their RECOMP_FPX_OPEN gate): one hardware multiply or fused multiply-add, kept when every
+   FPSR bit the Arm op could raise is already set and the value is the Arm one.
+   FZ: a subnormal operand is flushed to a zero of its sign (IDC). NaN: never. Infinite: exact with an infinite operand,
+   else an overflow (OFC). A zero product or an exact cancellation (a*b == -z in binary64, where the product is exact):
+   exact. Otherwise a result at most the smallest normal may be tiny (UFC): FZ clear, the IEEE gradual-underflow result is
+   Arm's; FZ set, below the smallest normal the exact value is tiny and Arm returns a zero of its sign, and exactly the
+   smallest normal is ambiguous (falls back). Rejected before computing: a NaN operand, a subnormal operand under FZ with
+   IDC clear, and FMUL of finite operands with neither OFC nor UFC set and nothing flushed (past the fast path, which keeps
+   a large product and a finite product of a zero, such a product is tiny or infinite). Without a hardware FMA
+   (RECOMP_FPX_FMA64; binary32 fmaf is the same instruction class) only the multiply is rescued. Returning 0 is always
+   sound: the wrapper then takes the exact body. */
+#ifndef A64_FPX_STICKY_PROBE
+#define A64_FPX_STICKY_PROBE() ((void)0) /* (tests/test_fpx_sticky.py counts the rescues the wrappers keep here) */
+#endif
+static inline __attribute__((always_inline)) int a64_fpx_sticky32(const Ctx *c, uint64_t a, uint64_t b, uint64_t z, int mul, uint64_t *v) {
+#if RECOMP_FPX_HOST
+    const uint64_t s = c->fpsr;
+    uint32_t x = (uint32_t)a, y = (uint32_t)b, w = (uint32_t)z, t;
+#if !RECOMP_FPX_FMA64
+    if (!mul) return 0;
+#endif
+    if ((x & 0x7fffffffu) > 0x7f800000u || (y & 0x7fffffffu) > 0x7f800000u || (w & 0x7fffffffu) > 0x7f800000u) return 0;
+    if (RECOMP_FPX_FZ(c) && (RECOMP_FPX_SUBN32(x) || RECOMP_FPX_SUBN32(y) || (!mul && RECOMP_FPX_SUBN32(w)))) {
+        if (!(s & 0x80u)) return 0;
+        if (RECOMP_FPX_SUBN32(x)) x &= 0x80000000u;
+        if (RECOMP_FPX_SUBN32(y)) y &= 0x80000000u;
+        if (RECOMP_FPX_SUBN32(w)) w &= 0x80000000u;
+    } else if (mul && !(s & 0xCu) && RECOMP_FPX_FIN32(x) && RECOMP_FPX_FIN32(y)) {
+        return 0;
+    }
+    /* (FMUL: w is the zero of the product's sign, so x*y + w is x*y) */
+#if RECOMP_FPX_FMA64
+    t = (uint32_t)recomp_fpx_fb(mul ? recomp_fpx_f(x) * recomp_fpx_f(y)
+                                    : __builtin_fmaf(recomp_fpx_f(x), recomp_fpx_f(y), recomp_fpx_f(w)));
+#else
+    t = (uint32_t)recomp_fpx_fb(recomp_fpx_f(x) * recomp_fpx_f(y));
+#endif
+    const uint32_t m = t & 0x7fffffffu;
+    if (m > 0x7f800000u) return 0;
+    if (m == 0x7f800000u) {
+        if (RECOMP_FPX_FIN32(x) && RECOMP_FPX_FIN32(y) && RECOMP_FPX_FIN32(w) && !(s & 4u)) return 0;
+    } else if (m <= 0x00800000u && !RECOMP_FPX_ZERO32(x) && !RECOMP_FPX_ZERO32(y)) {
+        if (!(s & 8u)) {   /* UFC clear: only an exact cancellation (+0, no bit) is kept */
+            if (mul || m != 0 || (double)recomp_fpx_f(x) * (double)recomp_fpx_f(y) != -(double)recomp_fpx_f(w)) return 0;
+        } else if (RECOMP_FPX_FZ(c)) {
+            if (m == 0x00800000u) return 0;
+            t &= 0x80000000u;
+        }
+    }
+    *v = t;
+    return 1;
+#else
+    (void)c; (void)a; (void)b; (void)z; (void)mul; (void)v; return 0;
+#endif
+}
 """
 
 
@@ -638,6 +689,11 @@ static inline int a64_fpx_fz_mul32(const Ctx *c, uint64_t a, uint64_t b, uint64_
 # copy: a call makes the caller store and reload the guest registers it keeps in host registers around every float
 # op; inlining the fast path everywhere made the exe 40% bigger and slower (RX_FPX_INLINE, build.py).
 HOT_FPX = re.compile(r"\ba64_fpx_(?!hot_|fz_)(\w+)\(c,")
+
+
+def hot_text(text):
+    """a hot function's text: its FPX helper calls go through the copies with the fast path inline"""
+    return HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
 
 
 def hot_functions():
@@ -672,14 +728,17 @@ def fpx_header(used):
            FPX_FZ_HEADER]
     for fast, exact, nf, ne in sorted(used):
         params = ", ".join("uint64_t a%d" % i for i in range(ne))
-        fz = ""
-        if fast in ("add32", "sub32", "mul32"):
-            fz = "if (A64_FPX_FZ_OPEN(c) && a64_fpx_fz_%s(c, a0, a1, &v)) return v; " % fast
+        # past the fast path, still inside its gate (tested once): the rescues above, else the exact body
+        rescue = ""
+        if (fast, exact) in (("mul32", "fma32"), ("fma32", "fma32")):
+            rescue = "if (a64_fpx_sticky32(c, a0, a1, a2, %d, &v)) { A64_FPX_STICKY_PROBE(); return v; } " % (fast == "mul32")
+        elif fast in ("add32", "sub32"):
+            rescue = "if ((c->fpsr & 0xCu) && a64_fpx_fz_%s(c, a0, a1, &v)) return v; " % fast
         out.append("A64_FPX_FN uint64_t a64_fpx_%s_%s(Ctx *c, %s) { uint64_t v; "
-                   "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; "
-                   "%sreturn recomp_fpe_%s(c, %s); }" % (fast, exact, params, fast,
-                                                          ", ".join("a%d" % i for i in range(nf)), fz, exact,
-                                                          ", ".join("a%d" % i for i in range(ne))))
+                   "if (RECOMP_FPX_OPEN(c)) { if (RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; %s} "
+                   "return recomp_fpe_%s(c, %s); }" % (fast, exact, params, fast,
+                                                       ", ".join("a%d" % i for i in range(nf)), rescue, exact,
+                                                       ", ".join("a%d" % i for i in range(ne))))
         # (the hot functions' copy, see HOT_FPX: the fast path inline, everything else through the helper)
         out.append("static inline __attribute__((always_inline)) uint64_t a64_fpx_hot_%s_%s(Ctx *c, %s) { uint64_t v; "
                    "if (RECOMP_FPX_OPEN(c) && RECOMP_LIKELY(recomp_fpx_%s(%s, RECOMP_FPX_FZ(c), &v))) return v; "
@@ -696,6 +755,12 @@ def fpx_header(used):
         if ("mul32", "fma32", 2, 3) in used:
             out.append(VFPX_MUL_HEADER)
     return "\n".join(out) + "\n"
+
+
+def op_text(text, fpx):
+    """one instruction's emitted C as lifted code has it: FPX guards outlined (their shapes added to fpx, which
+    fpx_header turns into a64_fpx.h), NEON FP vectorized, stores widened, flags packed"""
+    return stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(text, fpx)))))
 
 
 class Lifter:
@@ -1482,7 +1547,7 @@ class Lifter:
         order = list(keys)
         tx, fl = a64emit.translate([keys[x] for x in order])
         fpx = set()
-        texts = dict(zip(order, zip((stack_stores(pack_flags(widen_vstores(vectorize_fpx(outline_fpx(t, fpx))))) for t in tx), fl)))
+        texts = dict(zip(order, zip((op_text(t, fpx) for t in tx), fl)))
         del tx, fl, keys, order
         with open(os.path.join(out_dir, "a64_fpx.h"), "w", newline="\n") as f:
             f.write(fpx_header(fpx))
@@ -1516,7 +1581,7 @@ class Lifter:
         for e in sorted(self.funcs):
             text, refs = self.emit_function(e, texts)
             if hot and self.fname(e) in hot:
-                text = HOT_FPX.sub(r"a64_fpx_hot_\1(c,", text)
+                text = hot_text(text)
                 nhot += 1
                 if hot_chunk is not None:
                     hot_chunk.append(text)

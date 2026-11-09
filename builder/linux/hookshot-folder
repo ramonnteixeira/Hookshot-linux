@@ -8,7 +8,7 @@ set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 installed() {
-    root=${HOOKSHOT_BUILDER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/hookshot/builder}
+    root=${HOOKSHOT_BUILDER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}}/hookshot/builder
     [ -f "$root/current" ] || return 1
     tag=$(tr -d ' \r\n' < "$root/current")
     [ -n "$tag" ] && [ -x "$root/versions/$tag/AppRun" ] || return 1

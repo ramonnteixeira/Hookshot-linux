@@ -410,3 +410,17 @@ def fetch_manifest(get=None):
         with open(override, encoding="utf-8") as handle:
             return parse_list(handle.read())
     return parse_list(get(LATEST_LIST).decode("utf-8"))
+
+
+def startup_manifest(root, get=None):
+    """The list begin_update installs on launch: the latest release, except when these tools ship a list of their own
+    that is that same release and no older than it (a self-contained -rc or Actions tab AppImage). Reinstalling an
+    older release's parts over those tools replaces files the working tools had (issue 990: a -rc shipped
+    gpu/vk/oot_cheat_items.h, the release's zip did not, and every launch lost it). The comparison is update_target's:
+    a builder that is not an older release still updates. A HOOKSHOT_LINUX_LIST is a deliberate override: it wins."""
+    latest = fetch_manifest(get)
+    if not os.environ.get("HOOKSHOT_LINUX_LIST"):
+        own = read_manifest(root)
+        if own and own.tag == tools_tag(root) and update_target(latest.tag, own.tag) == own.tag:
+            return own
+    return latest

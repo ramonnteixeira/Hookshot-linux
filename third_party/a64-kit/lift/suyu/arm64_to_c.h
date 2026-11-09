@@ -334,6 +334,8 @@ inline bool EmitGuardGen() {
 inline bool g_emit_fpx = false;
 // Instrumentation only, never timed: with g_emit_fpx, the exact body runs
 // after every fast path too, and recomp_fpx_shadow compares the two.
+// It compares the inline form only: the outlined wrappers' rescues past the
+// fast path (a64_lift.py's a64_fpx.h) never run in it.
 inline bool g_emit_fpx_shadow = false;
 
 // Hybrid exports translate the gated forms too. g_translate_all gates only SHL
@@ -6534,6 +6536,17 @@ inline const char* FpxH() {
    correctly rounded, so under the host FP mode below every such result equals
    the ARM result bit for bit. Anything else takes the unchanged exact body,
    which FPX1 sites call out of line (recomp_fpe_*, recomp_runtime.c).
+
+   Lifted code keeps more than the above: a64_lift.py outlines each guard
+   into a wrapper (a64_fpx_*, a64_fpx.h) that, past these fast paths and
+   inside the same gate, also keeps the native FADD/FSUB S result that
+   overflowed with OFC already set or, under FZ, is flushed with UFC already
+   set (a64_fpx_fz_add32/sub32), and the native
+   FMUL/FNMUL/FMLA-family S result, tiny, infinite or of flushed inputs
+   included, when every flag the op could raise (IDC, UFC, OFC) is already
+   set (a64_fpx_sticky32; checked game-free by Hookshot's
+   tests/test_fpx_sticky.py). The shadow build keeps the inline form above
+   and never reaches those wrappers, so it does not validate them.
 
    Host contract, enforced by the host once it has negotiated FPX1 through
    recomp_image_fpx_v1: on x86-64 MXCSR round-to-nearest with DAZ and FTZ clear

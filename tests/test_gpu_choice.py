@@ -11,6 +11,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def preset_exempt(menu, value):
+    """the menu's row for opts.<value> leaves the quality preset alone (Row::preset_exempt, which set_row checks)"""
+    start = menu.index("&opts.%s," % value, menu.index("Row rows[] = {"))
+    row = menu[start:menu.index("},", start)]
+    return row.rstrip().endswith(", true") and "if (!r.preset_exempt)" in menu
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cxx", default="g++")
@@ -31,7 +38,7 @@ def main():
     if pick.index('getenv("RX_VK_DEVICE")') > pick.index("gpu_choice::menu_device"):
         raise SystemExit("pick_device takes the GPU row before RX_VK_DEVICE")
     menu = (vk / "vk_menu.cpp").read_text(encoding="utf-8")
-    if "r.value != &opts.gpu_device" not in menu:
+    if not preset_exempt(menu, "gpu_device"):
         raise SystemExit("vk_menu.cpp: changing the GPU row resets the quality preset (and its VRAM budget) to Custom")
     with tempfile.TemporaryDirectory(prefix="gpu-choice-") as tmp:
         exe = Path(tmp) / "gpu-choice"

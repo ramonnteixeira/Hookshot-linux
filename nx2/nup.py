@@ -220,6 +220,8 @@ class Nup:
         what it holds is zstd again"""
         if r[5] == 1:   # The TOC explicitly marks outer compression, even for a non-Zstd .zs payload.
             return True
+        if not name:
+            name = self.name(r[0], r[1])
         self.f.seek(r[3])
         head = self.f.read(18)
         if head[:4] != ZSTD:

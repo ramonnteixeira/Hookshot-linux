@@ -140,6 +140,8 @@ void hos_update_check(void) {
     wchar_t *slash = wcsrchr(wdir, L'\\');
     if (slash) *slash = 0;
     if ((INT_PTR)ShellExecuteW(NULL, L"open", wbuilder, args, slash ? wdir : NULL, SW_SHOWNORMAL) > 32) {
+        void hos_log_flush(void);
+        hos_log_flush();   /* (the lines logged before, queued: host/hos_thread.c log_queue) */
         fprintf(stderr, "update: Hookshot Builder started to update to %s; the game closes\n", tag);
         fflush(stderr);
         ExitProcess(0);

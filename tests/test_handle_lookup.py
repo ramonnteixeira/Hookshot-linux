@@ -14,7 +14,7 @@ def main():
     source = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
     start = source.index("VkImageView texture_view_of(")
     body = source[start:source.index("struct BankCache", start)]
-    finds = body.count("handle_hits.find")
+    finds = body.count("handle_hits().find")
     if finds != 1:
         raise SystemExit(f"texture_view_of searches the handle map {finds} times")
     if "RX_VK_LOG_HITS" not in body:

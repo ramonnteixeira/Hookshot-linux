@@ -159,6 +159,8 @@ with `--update <game folder>`.
 - Saves: the `user` folder in the game folder on Windows, `~/.local/share/hookshot` on Linux (a `user` folder from an
   earlier Linux build is moved there once). `--user <folder>` puts them somewhere else ([command line
   arguments](#running-the-game-from-the-command-line)).
+  To carry on with a save from an emulator (Lichii, Eglantine, Orchid, ...) or NX2navi, or to take yours there, see
+  [using a save from an emulator](docs/saves.md).
 - To uninstall, delete the game folder, the builder's folder and the shortcuts.
 
 ### If something goes wrong
@@ -169,13 +171,30 @@ with `--update <game folder>`.
 | "Hookshot supports build e0f3ccfa" or "This version isn't supported" | Check that you chose the right game with its update installed |
 | The game opens and closes, or the log says "device lost" | Update your graphics driver. On AMD cards there are known crashes ([#708](https://github.com/NotRexed/Hookshot/issues/708), [#614](https://github.com/NotRexed/Hookshot/issues/614)) |
 | Parts of the picture are missing, or a message says your card has no mesh shader support | The card or its driver has no mesh shaders. Update the driver; older cards are not supported ([#640](https://github.com/NotRexed/Hookshot/issues/640)) |
+| AMD: blocky textures, solid rectangles in the sky or unusually dark courtyard surfaces | Try the [RGBA8 texture workaround](#amd-texture-workaround). It uses more graphics memory |
 | Linux: the game does not start or the picture is broken | The game needs a Vulkan 1.3 driver with mesh shaders. Check with `vulkaninfo \| grep mesh`: it should list `VK_EXT_mesh_shader`. Update Mesa or the NVIDIA driver |
+| Steam Deck: the game freezes and closes in Kokiri Forest or the Great Deku Tree (`gfx_0.0.0 timeout` in `journalctl -k`) | `RX_VK_SKIP_CODE=2c56dc1006942f74` in `hookshot_env.txt` gets past it, but the models those draws make go missing (see *Switches for testing* below, [#817](https://github.com/NotRexed/Hookshot/issues/817)) |
 | "Your antivirus removed part of the build tools" | A false alarm on unsigned programs. Restore the files from Windows Security's Protection history, or add `%LOCALAPPDATA%\HookshotBuilder` to its exclusions, then press **Repair** |
 | Stutter the first time you see something | Normal for now: shaders are being prepared. It gets better when you pass through the same place again |
 | The game is in the wrong language | Change the code in `language.txt` in the game folder. The file lists them all |
 
 If the problem continues, [report it](https://github.com/NotRexed/Hookshot/issues/new/choose) with the version, where
 you were in the game, your graphics card, `hookshot_log.txt` and a screenshot or video. Never send game files.
+
+#### AMD texture workaround
+
+For these AMD texture artifacts, try keeping decoded ASTC textures as RGBA8 instead of re-encoding them to BC3
+([#57](https://github.com/NotRexed/Hookshot/issues/57), [#1006](https://github.com/NotRexed/Hookshot/issues/1006)).
+Close the game, then create or edit `hookshot_env.txt` in the built game folder, beside `image.bin`, and add:
+
+```ini
+RX_VK_ASTC_RGBA8=1
+```
+
+Restart the game. The same setting applies when Steam or RecompLauncher starts that game folder.
+
+This is a workaround for some artifacts, not a general lighting fix. It can substantially increase graphics-memory
+use and cause stalls when the card runs out of headroom. To undo it, remove that line and restart the game.
 
 ## In-game menu
 
@@ -194,7 +213,7 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | | Frame generation | Off, 2x to 8x | Off |
 | | Frame pacing | Off, On | Off |
 | | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size) | Auto |
-| | Output resolution | 2048x1152, 2560x1440, 3840x2160 (after a restart) | 2048x1152 |
+| | Output resolution | 1920x1080, 2048x1152, 2560x1440, 3840x2160 (after a restart) | 2048x1152 |
 | | Upscaling | Off, Catmull-Rom, Lanczos | Off |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Handheld profile | Off, On (after a restart) | Off |
@@ -203,12 +222,19 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | Gameplay | FPS counter | Off, On | Off |
 | | Game speed | Per frame, Real time | Real time |
 | | Text speed | Normal, 2x, 4x, Instant | Normal |
+| | Microphone | Off, Default, or each microphone by name | Default |
 | Controls | Controller in background | Off, On | Off |
 | | Mouse camera | As the stick, Native | As the stick |
 | | Mouse sensitivity | 0.10 to 5.00 | 1.00 |
 | | Invert mouse vertical | Off, On | Off |
 | | Invert camera X | Off, On | Off |
 | | Invert camera Y | Off, On | Off |
+| | Rumble strength | Off, 25% to 150%, in steps of 25 | 100% |
+| | Motion controls | Off, On | On |
+| | Motion sensitivity X | 10% to 300% | 100% |
+| | Motion sensitivity Y | 10% to 300% | 100% |
+| | Invert motion X | Off, On | Off |
+| | Invert motion Y | Off, On | Off |
 | | Layout preset | Nintendo (Def), Xbox / PC, Swap Face, Custom | Nintendo (Def) |
 | | Controls | Opens the Controls page | |
 
@@ -222,8 +248,10 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
   show artifacts. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
 - **Output resolution** is the size of the game's whole frame, HUD included, before it is scaled to your window.
-  Resolution is a share of it, and its row shows the size for the output you chose. Docked only. At 3840x2160 the game's
-  render targets get a bigger GPU pool, so a full-size 3D fits. `HOS_OUTPUT_RES=0/1/2` sets it for one run.
+  On a 1920x1080 display, the 1920x1080 option keeps HUD and text sharp when the game fills the screen by mapping them
+  pixel for pixel. The separate **Resolution** setting scales the 3D scene as a share of the output size. Docked only.
+  At 3840x2160 the game's render targets get a bigger GPU pool so full-size 3D fits. For one run, set `HOS_OUTPUT_RES`
+  to `3` for 1920x1080, `0` for 2048x1152, `1` for 2560x1440, or `2` for 3840x2160.
 - **Upscaling** and **Sharpness** also work when Frame generation is Off.
 - **Handheld profile** runs the game as if the console were undocked: lower resolution, lighter on the GPU.
 - **Robust buffers:** a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; Off
@@ -231,10 +259,23 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 - **Game speed:** with Per frame, the game runs slower whenever it is below 60 fps. Real time keeps it at normal speed
   down to 15 fps.
 - **FPS counter** shows in the top right corner. With frame generation on, it also shows the game's own rate.
+- **Microphone** is what the ocarina hears when the game's own microphone option is on (an instrument, or humming).
+  Default follows Windows' default recording device; the list shows each microphone by name, and a change applies at
+  once. A chosen microphone that is unplugged stays chosen (shown as not connected): Default stands in until it is
+  back. On Linux (SDL2) two microphones with the same name cannot be told apart: the first is used. Windows must allow desktop apps to use the microphone
+  (Settings, Privacy & security, Microphone). `HOS_MIC_LOG=1` logs what the game reads, a line a second.
 - **Controller in background:** On keeps the controller working while another window has the focus. The keyboard and
   mouse still need the game's window.
 - **Mouse camera:** Native turns the camera with the mouse one to one, as in a PC game. As the stick uses the mouse in
   place of the right stick. The <kbd>-</kbd> and <kbd>=</kbd> keys change the sensitivity in game too.
+- **Rumble strength** scales the controller's rumble: 100% is the game's own, Off turns it off. The game's HD rumble
+  goes to a controller's heavy and light motors by its frequency.
+- **Motion controls:** the controller's gyroscope aims where the game uses motion, as on the Switch. It works with
+  Switch Pro controllers and pads in Switch mode, DualSense and DualShock 4 (through SDL), held flat or upright. Its row
+  says whether the connected pad has a gyroscope; Off leaves the game seeing a pad lying still. **Motion sensitivity X/Y**
+  scale the left-right and up-down aim (100% is the console's), **Invert motion X/Y** turn either direction around. Motion follows the pad used
+  last. The gyroscope's drift is learned while the pad rests on a table, so set it down for a second if the aim
+  creeps. `HOS_MOTION_DEBUG=1` (in `hookshot_env.txt`) logs what the game gets twice a second.
 - **Layout preset:** Nintendo has A on the right face button, Xbox / PC and Swap Face put A on the bottom one. Changing
   a button yourself sets it to Custom.
 
@@ -242,6 +283,7 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 
 Use a controller, or the keyboard and mouse. On the keyboard, <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> move
 and the arrow keys (or <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd>) turn the camera.
+With the default keyboard bindings, press <kbd>E</kbd> to select **New Game** on the title screen.
 
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
@@ -395,6 +437,9 @@ Switches to test (`RX_VK_NOOPT=1` and the others) go in `hookshot_env.txt` in th
 line, on Windows and Linux. The running game reads it, not the builder. A test run can name another file with
 `HOS_ENV_FILE=<path>`; the game then reads that one instead and leaves `hookshot_env.txt` alone.
 
+To enable the debug menu, add `HOS_OOT_CHEATS=1` to `hookshot_env.txt` in the game folder. Restart the game,
+press **Insert**, then open **Gameplay → Cheats**.
+
 For a first run on a 4 GB card such as a GTX 1650, `RX_VK_LOW_SPEC=1` starts with the Minimum (4GB) preset, with
 frame generation and upscaling off. It applies only when there is no `hookshot_options.ini` yet; after that, change
 the settings in the in-game menu.
@@ -402,6 +447,13 @@ the settings in the in-game menu.
 `RX_VK_MOVIE_UPSCALE=linear` replaces the movies' neural upscale with the plain linear one. The default, `auto`, keeps
 the networks and falls back only when a movie frame takes the GPU more than 40 ms. It does not change the gameplay
 upscaler, and movies can look softer. `RX_VK_NETWORK_KEEP=all` takes precedence and keeps the movie networks.
+
+`RX_VK_SKIP_CODE=<prefix,...>` leaves out the draws of every program with a stage whose native code key starts with one
+of the prefixes (the keys the log prints after "its code:"). On a Steam Deck, `RX_VK_SKIP_CODE=2c56dc1006942f74`
+avoids a GPU hang in Kokiri Forest and the Great Deku Tree: the GPU runs for seconds in the programs that share that
+task shader (a culling pass) until the kernel resets it ([#817](https://github.com/NotRexed/Hookshot/issues/817)).
+It is a workaround, not a fix: those are task + mesh programs, so the geometry they draw goes with them, and key models
+are missing while it is set. Off unless set.
 
 </details>
 

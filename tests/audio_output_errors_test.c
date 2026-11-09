@@ -23,9 +23,9 @@ typedef struct { LPSTR lpData; unsigned dwBufferLength, dwFlags; } WAVEHDR;
 
 static const char *scenario;
 static int prepare_calls, write_calls, accepted, unprepare_calls, open_calls, close_calls, reset_calls, logs;
-static unsigned last_device;
+static unsigned last_device, last_channels;
 static uint64_t now_ms;
-static int fail_prepare, fail_write, fail_unprepare, fail_open;
+static int fail_prepare, fail_write, fail_unprepare, fail_open, fail_open6;
 static int queued[10];
 static WAVEHDR *known[10];
 static char last_log[512];
@@ -48,9 +48,11 @@ static MMRESULT test_open(HWAVEOUT *out, unsigned device, const WAVEFORMATEX *f,
                           uintptr_t callback, uintptr_t instance, unsigned flags) {
     (void)callback; (void)instance; (void)flags;
     last_device = device;
-    CHECK(f->nChannels == 2 && f->nSamplesPerSec == 48000 && f->wBitsPerSample == 16);
+    CHECK((f->nChannels == 2 || f->nChannels == 6) && f->nSamplesPerSec == 48000 && f->wBitsPerSample == 16);
+    CHECK(f->nBlockAlign == 2 * f->nChannels && f->nAvgBytesPerSec == 48000 * f->nBlockAlign);
+    last_channels = f->nChannels;
     open_calls++;
-    if (fail_open) return 7;
+    if (fail_open || (fail_open6 && f->nChannels == 6)) return 7;   /* (MMSYSERR_NOMEM; a device without 5.1: 32) */
     *out = (void *)(uintptr_t)1;
     return 0;
 }
@@ -97,6 +99,9 @@ static unsigned au_device_count(void) { return 2; }
 static void au_device_name(unsigned device, char *out, size_t size) { snprintf(out, size, "test device %u", device); }
 static uint64_t au_ms(void) { return now_ms; }
 static void au_opened(HWAVEOUT w) { (void)w; }
+static int speakers = 2;   /* (the game's speakers: 6 in the "surround" and "fallback" cases) */
+static int au_speakers(void) { return speakers; }
+static const WAVEFORMATEX *au_format(const WAVEFORMATEX *f) { return f; }
 #define getenv test_getenv
 #define waveOutOpen test_open
 #define waveOutPrepareHeader test_prepare
@@ -113,9 +118,9 @@ static void complete_all(void) {
     }
 }
 static void frames(int count, int complete) {
-    int16_t pcm[FRAME * 2];
+    int16_t pcm[FRAME * 6];
     for (int j = 0; j < count; j++) {
-        for (int i = 0; i < FRAME * 2; i++) pcm[i] = (int16_t)(j * 31 + i);
+        for (int i = 0; i < FRAME * out_channels; i++) pcm[i] = (int16_t)(j * 31 + i);
         output_frame(pcm);
         if (complete) complete_all();
     }
@@ -128,8 +133,17 @@ int main(int argc, char **argv) {
     fail_unprepare = !strcmp(scenario, "unprepare");
     fail_open = !strcmp(scenario, "open");
     if (!strcmp(scenario, "bounded")) fail_prepare = -1;
+    if (!strcmp(scenario, "surround") || !strcmp(scenario, "fallback")) speakers = 6;
+    fail_open6 = !strcmp(scenario, "fallback");
     output_open();
-    if (fail_open) {
+    if (fail_open6) {
+        CHECK(open_calls == 4 && last_channels == 2 && last_device == WAVE_MAPPER);   /* (5.1 on all three, then stereo) */
+        CHECK(out_channels == 2 && hdr[0].dwBufferLength == FRAME * 2 * 2 * 2);
+        CHECK(strstr(last_log, "default device") && strstr(last_log, "stereo"));
+        logs = 0;
+        frames(40, 1);
+        CHECK(accepted == 20 && !logs);
+    } else if (fail_open) {
         CHECK(open_calls == 3);   /* (the default, then both devices; HOS_AUDIO_DEVICE unset) */
         CHECK(!wout);
         frames(40, 1);
@@ -137,7 +151,14 @@ int main(int argc, char **argv) {
         CHECK(strstr(last_log, "waveOutOpen") && strstr(last_log, "7"));
     } else if (open_calls != 1 || last_device != WAVE_MAPPER || logs != 1 || !strstr(last_log, "default device")) {
         CHECK(0);   /* (a working default is opened first, and named in the log) */
-    } else if ((logs = 0), !strcmp(scenario, "stall")) {
+    } else if ((logs = 0), !strcmp(scenario, "surround")) {
+        CHECK(last_channels == 6 && out_channels == 6 && strstr(last_log, "5.1"));
+        CHECK(hdr[0].dwBufferLength == FRAME * 2 * 6 * 2);   /* (two frames of six 16-bit channels) */
+        frames(40, 1);
+        CHECK(accepted == 20 && prepare_calls == 20 && write_calls == 20 && !logs);
+        CHECK(blocks[9][0] == 38 * 31 && blocks[9][FRAME * 6] == 39 * 31);
+        CHECK(blocks[9][FRAME * 6 - 1] == (int16_t)(38 * 31 + FRAME * 6 - 1));
+    } else if (!strcmp(scenario, "stall")) {
         frames(20, 0);                   /* every block queued, none ever completes: the device takes nothing */
         now_ms += 1000;
         frames(1, 0);                    /* the stall noticed */

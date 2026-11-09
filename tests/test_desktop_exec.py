@@ -49,8 +49,15 @@ class DesktopExecTests(unittest.TestCase):
         self.assertEqual(field_codes(arg), [])
 
     def test_a_quote_and_a_backslash_stay_inside_the_argument(self):
+        # (Desktop Entry spec: the Exec quoting backslash, doubled by the file's string escaping; a literal backslash is four)
         arg = builder.desktop_exec('/home/steve/My "Games"\\Hookshot/hookshot')
-        self.assertEqual(arg, '"/home/steve/My \\"Games\\"\\\\Hookshot/hookshot"')
+        self.assertEqual(arg, '"/home/steve/My \\\\"Games\\\\"\\\\\\\\Hookshot/hookshot"')
+
+    def test_a_dollar_and_a_backtick_are_escaped_too(self):
+        # (inside double quotes the spec reserves " ` $ and \, so a $ or a backtick in the folder is not left bare)
+        arg = builder.desktop_exec("/home/steve/$HOME/`id`/hookshot")
+        self.assertEqual(arg, '"/home/steve/\\\\$HOME/\\\\`id\\\\`/hookshot"')
+        self.assertEqual(field_codes(arg), [])
 
     def test_validator_rejects_the_old_line(self):
         validate = shutil.which("desktop-file-validate")

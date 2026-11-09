@@ -114,6 +114,17 @@ bool texture_marked(const Texture* tex);
 /// segment made are made again by an earlier one that needs them, as each segment's uploads precede it)
 void texture_set_segment(uint64_t seg);
 uint64_t texture_segment();
+/// A parallel replay's segments, in queue order: each one's init command buffer (begun; submitted right before its
+/// uploads). A new image's first layout change (UNDEFINED -> GENERAL, and its clear) that a segment's worker makes goes
+/// to the earliest segment's still being recorded, not to the maker's own uploads: a segment before the maker's that
+/// uses it is submitted first, and found it UNDEFINED (VUID-vkCmdDraw-None-09600 with RX_VK_PARALLEL only)
+void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n);
+/// This thread records segment `index` of them (-1: none, after it)
+void texture_segment_worker(int index);
+/// Segment `index` recorded: its init command buffer ended (no new image's change goes to it after). 1: something went
+/// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost: the
+/// replay stops)
+int texture_segment_end(int index);
 /// Changes with every submission (a texture touched in it is not checked again in it)
 uint32_t texture_epoch();
 /// Changes whenever a texture is destroyed (pointers to textures kept elsewhere go stale)

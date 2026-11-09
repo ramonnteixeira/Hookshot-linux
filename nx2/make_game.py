@@ -1001,6 +1001,20 @@ def main(a=None):
         key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
         if os.path.exists(key_file):
             os.remove(key_file)   # (a lift stopped halfway leaves no key behind)
+        # (hookshot) the lifted C of an earlier lift goes first: a file that lift made and this one does not (another builder's naming,
+        # a chunk cut short) was compiled with the new ones, undefined or doubly defined game functions at the link (issue 1176).
+        # The objects stay cached by their contents, so a file this lift writes the same is not compiled again
+        gen_dir = os.path.join(work, "sa", "gen")
+        if os.path.isdir(gen_dir):
+            for f in os.listdir(gen_dir):
+                if f.startswith("code_") and (f.endswith(".c") or f.endswith(".c.whole")):
+                    try:
+                        os.remove(os.path.join(gen_dir, f))
+                    except FileNotFoundError:
+                        pass   # (already gone: another cleanup removed it)
+                    except OSError as e:
+                        fail("Could not remove earlier translated file %s: %s. The new translation has not started." %
+                             (os.path.join(gen_dir, f), e))
         run(PY + ["nx2/lift.py", "--standalone", "--write", "--exefs", exefs, "--work", work], env)
         if os.path.isfile(os.path.join(work, "sa", "gen", "code_hot.c")):
             run(PY + ["nx2/split_hot.py", os.path.join(work, "sa", "gen")], env)   # (eight files side by side: ~6 minutes, not 79)
@@ -1055,7 +1069,17 @@ def main(a=None):
             parts = line.split(" ")
             if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
                 plan[:] = [int(parts[1]), int(parts[2])]
-    run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)
+    try:
+        run(PY + ["nx2/build.py", "--standalone", "--jobs", str(a.jobs)], env, compiled)
+    except SystemExit:
+        # (hookshot) a compile or link that failed forgets the lift: the next build translates the game again. A lifted file cut short
+        # (an antivirus, a full disk, a stopped run: "g_module_b" for g_module_base, issue 1197) or lifted C another builder left (20
+        # undefined game functions at the link, issue 1176) otherwise failed the same way at every try, the key still matching
+        key_file = os.path.join(work, "sa", "gen", LIFT_KEY)
+        if os.path.exists(key_file):
+            os.remove(key_file)
+            print("the build failed: the next one translates the game again (its translated code is not reused)", flush=True)
+        raise
     compile_seconds = time.time() - compile_started
 
     say("stage", "finish", "Putting the game folder together")

@@ -52,7 +52,8 @@ static Texture texture;
 static struct { bool push_descriptor=false; } dev;
 static bool vkCmdPushDescriptorSetKHR=true;
 struct ImageInfo { VkImageView imageView; };
-static struct { std::vector<ImageInfo> imgs; } dw;
+static struct DrawWork { std::vector<ImageInfo> imgs; } draw_work;
+static DrawWork& dw() { return draw_work; }   // (vk_draw.cpp's dw is a TLS_OBJECT: the calling thread's, by a call)
 static unsigned handle_value=5;
 static bool resolve_image=true, upscale_result=true;
 static int upscale_calls, view_calls, handle_calls;
@@ -102,15 +103,15 @@ int main(int argc,char** argv){
     check(key_reads==0,"1000 warm rejected invocations perform no key lookup");
     check(handle_calls==0 && view_calls==0 && upscale_calls==0,"capability rejection avoids resource boundary calls");
     if(expected){
-        dev.push_descriptor=true;dw.imgs={{11},{22},{33},{44}};
+        dev.push_descriptor=true;dw().imgs={{11},{22},{33},{44}};
         auto rejected=[&](const char* what){key_reads=0;int prior=upscale_calls;check(!taau_stand_in(19,state,program),what);check(key_reads==0 && upscale_calls==prior,"rejected resource guard never reads/forwards keys");};
         vkCmdPushDescriptorSetKHR=false;rejected("missing push entry");vkCmdPushDescriptorSetKHR=true;
         auto stages=program.stages;program.stages.clear();rejected("empty stages");program.stages=stages;
         program.stages[0].info.texture_descriptors.clear();rejected("no textures");program.stages=stages;
         program.stages[0].info.image_descriptors.clear();rejected("no images");program.stages=stages;
-        dw.imgs.pop_back();rejected("descriptor span too short");dw.imgs.push_back({44});
-        dw.imgs[0].imageView=0;rejected("no input view");dw.imgs[0].imageView=11;
-        dw.imgs[3].imageView=0;rejected("no output view");dw.imgs[3].imageView=44;
+        dw().imgs.pop_back();rejected("descriptor span too short");dw().imgs.push_back({44});
+        dw().imgs[0].imageView=0;rejected("no input view");dw().imgs[0].imageView=11;
+        dw().imgs[3].imageView=0;rejected("no output view");dw().imgs[3].imageView=44;
         handle_value=0;rejected("no handle");handle_value=5;
         resolve_image=false;rejected("no resolved image");resolve_image=true;
         texture.format=0;rejected("wrong output format");texture.format=VK_FORMAT_B10G11R11_UFLOAT_PACK32;

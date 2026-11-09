@@ -202,8 +202,10 @@ NV(nvnDeviceGetImageHandle) { RET((uint64_t)I(1)); }
 /* combined handle = texture id (20 bits) | sampler id << 20: the Maxwell layout, which the shaders' handle reads expect */
 NV(nvnDeviceGetTextureHandle) {
     const int t = I(1), s = I(2);
-    if (t < 0 || t >= (1 << 20) || s < 0 || s >= (1 << 12)) die("texture handle ids %d/%d", t, s);
-    RET((uint64_t)t | (uint64_t)s << 20);
+    /* The SDK sign-extends both ids before combining them, and texture 0 always means no handle.
+       A missing texture can have id -1 (Castle Town's guard house): it stays the all-ones sentinel,
+       rather than stopping the game here. Keep the signed ids, including their upper bits. */
+    RET(t ? (uint64_t)t | (uint64_t)s << 20 : 0);
 }
 NV(nvnDeviceGetTexelFetchHandle) { RET((uint64_t)I(1)); }
 NV(nvnDeviceGetSeparateTextureHandle) { RET((uint64_t)I(1)); }

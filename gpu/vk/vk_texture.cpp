@@ -122,6 +122,12 @@ VkFormat storage_view_format(VkFormat f) {
     case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R16G16B16A16_SNORM: return VK_FORMAT_R32G32_UINT;
     case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R16_SNORM: return VK_FORMAT_R16_UINT;
     case VK_FORMAT_R8_SNORM: return VK_FORMAT_R8_UINT;
+    // (compressed: one block a texel, written raw by the game's encoders)
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC4_UNORM_BLOCK:
+    case VK_FORMAT_BC4_SNORM_BLOCK: return VK_FORMAT_R32G32_UINT;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC5_UNORM_BLOCK:
+    case VK_FORMAT_BC5_SNORM_BLOCK: case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+    case VK_FORMAT_BC7_UNORM_BLOCK: return VK_FORMAT_R32G32B32A32_UINT;
     default: return f;
     }
 }
@@ -186,6 +192,18 @@ bool remade_log_on() {
     static const bool on = getenv("RX_VK_LOG_REMADE") && atoi(getenv("RX_VK_LOG_REMADE")) != 0;
     return on;
 }
+// (hookshot) Textures uploaded from the game's memory (never drawn by the GPU) that the budget evicted: storage, size and format.
+// Made again, such a texture is uploaded from that memory whatever ranges render targets once took over it (upload's "storage
+// the GPU rendered" skip below). Skipped, its new image was never filled: whatever the VRAM held before, random-colour blocks on
+// characters, shop shelves, floors, which spread over play time on 4-8 GB cards (the ones that evict) and changed each time a
+// menu was opened and closed (issue 993). RX_VK_REMADE_SKIP=1: as before
+std::mutex from_memory_mu;
+std::unordered_map<uint64_t, uint64_t> evicted_from_memory;   // (evicted_key -> guest size)
+std::atomic<uint64_t> st_remade_uploaded{0};
+bool remade_skip_old() {
+    static const bool on = getenv("RX_VK_REMADE_SKIP") && atoi(getenv("RX_VK_REMADE_SKIP")) != 0;
+    return on;
+}
 
 struct Dead {
     uint64_t value;
@@ -204,7 +222,7 @@ uint64_t rec_value = 0;                                   // record their own up
 thread_local bool up_used = false;
 thread_local uint64_t tl_seg = 0;
 uint32_t epoch = 0;
-int64_t st_uploads, st_astc, st_bytes, st_gpu_unswizzled;
+int64_t st_uploads, st_astc, st_bytes;
 
 VkCommandBuffer upload_cmd() {
     if (!up_used) {
@@ -213,6 +231,48 @@ VkCommandBuffer upload_cmd() {
     }
     return up_cmd;
 }
+
+// ---- (parallel replay) a new image's first layout change, in queue order ----
+// The segments' workers record at once, and the one that makes an image first need not be the first in the queue to use
+// it: a later segment's worker made it (its UNDEFINED -> GENERAL change in its own uploads, submitted after the earlier
+// segment), the earlier one used it (a copy into it again, the BC3 encoder's dispatch: its uploads, at the start of its
+// command buffers), and the queue reached that use with the image UNDEFINED (VUID-vkCmdDraw-None-09600, RX_VK_PARALLEL
+// only). The change goes to the init command buffer of the earliest segment still being recorded instead: those before
+// it were done before the image was made, so never used it, and each segment's init is submitted before its uploads.
+struct SegInit {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool used = false, open = false;
+};
+std::mutex seg_init_mu;
+std::vector<SegInit> seg_inits;    // (the submission's segments, in queue order; seg_init_mu)
+thread_local int tl_seg_index = -1;   // (the segment this thread records; -1: none)
+/// While it lives, upload_cmd() is the earliest open segment's init command buffer (a segment's worker only)
+struct InitRedirect {
+    std::unique_lock<std::mutex> lk;
+    SegInit* to = nullptr;
+    VkCommandBuffer saved_cmd = VK_NULL_HANDLE;
+    bool saved_used = false;
+    explicit InitRedirect(bool want = true) {
+        if (!want || tl_seg_index < 0) return;
+        lk = std::unique_lock<std::mutex>(seg_init_mu);
+        for (int i = 0; i <= tl_seg_index && i < (int)seg_inits.size(); i++)
+            if (seg_inits[i].open) { to = &seg_inits[i]; break; }
+        if (!to) { lk.unlock(); return; }   // (none open: its own is, while it records)
+        saved_cmd = up_cmd, saved_used = up_used;
+        up_cmd = to->cmd, up_used = to->used;
+    }
+    void done() {
+        if (to) {
+            to->used = up_used;
+            up_cmd = saved_cmd, up_used = saved_used;
+            to = nullptr;
+        }
+        if (lk.owns_lock()) lk.unlock();
+    }
+    ~InitRedirect() { done(); }
+    InitRedirect(const InitRedirect&) = delete;
+    InitRedirect& operator=(const InitRedirect&) = delete;
+};
 
 // ---- staging: host-visible arenas, reused once the submission that filled them completed ----
 struct Arena {
@@ -321,7 +381,9 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
                       uint32_t nlevels, uint32_t layer0, uint32_t nlayers, const VkComponentMapping& cm,
                       VkImageUsageFlags usage) {
     if (!usage || (usage & tex->usage) != usage) return VK_NULL_HANDLE;
-    if (is_bc(tex->format) && !is_bc(f) && (nlevels != 1 || nlayers != 1)) return VK_NULL_HANDLE;
+    // (block-texel views of a compressed image: one level; several layers where the driver takes them)
+    const bool block_view = is_bc(tex->format) && !is_bc(f);
+    if (block_view && nlevels != 1) return VK_NULL_HANDLE;
     VkImageViewUsageCreateInfo uci{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     uci.usage = usage & tex->usage;
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -332,6 +394,11 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
     vi.components = cm;
     vi.subresourceRange = {aspect, level0, nlevels, layer0, nlayers};
     VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev.device, &vi, nullptr, &v) == VK_SUCCESS) return v;
+    if (!block_view || nlayers == 1) return VK_NULL_HANDLE;
+    // (Vulkan 1.1 says a block-texel view is of a single layer; some drivers hold to it)
+    vi.subresourceRange.layerCount = 1;
+    if (vi.viewType == VK_IMAGE_VIEW_TYPE_2D_ARRAY) vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
     if (vkCreateImageView(dev.device, &vi, nullptr, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
     return v;
 }
@@ -371,7 +438,11 @@ std::chrono::steady_clock::time_point bc_used_at;
 uint64_t bc_last_value = 0;   // (the recording that last used them: they go once it is done)
 std::atomic<bool> bc_have{false};
 uint32_t bc_idle_s() {
-    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S")) : 20;
+    // (hookshot) 0 by default again, kept once made: given back after 20 s, the garbled/rainbow textures of 4-8 GB cards followed
+    // (issue 993): every such log has the "given back" line, an RTX 3050 4 GB player's went away with RX_VK_BC_IDLE_S=0 and not with
+    // RX_VK_NO_EVICT=1, and they began with v2.0.3, which brought this give-back. Its cost: 160-288 MB of VRAM held after the first
+    // decode. RX_VK_BC_IDLE_S=<seconds>: given back as before
+    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S")) : 0;
     return v;
 }
 bool bc_scratch_make() {   // (bc_mu held)
@@ -520,6 +591,9 @@ bool bc_scratch_layout(VkCommandBuffer cmd, bool resized = false) {
         bc_used_at = std::chrono::steady_clock::now();
         bc_last_value = rec_value;
     }
+    // (a segment's worker: a fresh scratch's layout change in queue order, as a new image's)
+    InitRedirect redirect((bc_scratch2_fresh && bc_scratch2) || bc_scratch_fresh);
+    if (redirect.to) cmd = upload_cmd();
     if (bc_scratch2_fresh && bc_scratch2) {   // (hookshot-amd: the second scratch, once made)
         bc_scratch2_fresh = false;
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -901,7 +975,6 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     }
     full_barrier(cmd);
     descriptors_disturbed();
-    st_gpu_unswizzled++;
     return true;
 }
 
@@ -910,7 +983,6 @@ bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
 /// the block rows it falls in.
 uint64_t st_made;          // (textures made)
 int64_t st_unswizzle_bytes, st_unswizzle_ns;   // (the CPU's unswizzling)
-int64_t st_never_written;   // (new textures over storage render targets took, not written since: not uploaded)
 std::map<uint64_t, std::pair<uint64_t, uint32_t>> gpu_owned;   // GPU address -> (end, memory generation then)
 thread_local uint64_t tl_watch_prog;
 /// (RX_VK_VERIFY_DIM=WxH: the guest memory of textures that size, hashed when uploaded and every 300 frames: a change
@@ -1415,6 +1487,7 @@ void forget_gpu(Texture* tex) {
 }
 
 Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw, int bh, int bpb) {
+    PROF_EXACT();   // (texture_get's slow path: PROF_TEXGET samples the rest)
     auto tex = std::make_unique<Texture>();
     Texture& x = *tex;
     x.gpu = t->gpu, x.d = t->d, x.L = t->L, x.nvn_format = t->d.format;
@@ -1468,7 +1541,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                                                            u, VK_IMAGE_TILING_OPTIMAL, &np, nullptr);
             x.sparse = np > 0;
         }
-        while (!x.sparse && astc && x.skip + 1 < x.levels && bytes_at(x.skip) > (64ull << 20) &&
+        // (RX_VK_TEX_SKIP_MB: from how many MB as RGBA8 a decoded ASTC texture wider than max_dim loses its top levels;
+        // 64 by default. The Steam Deck's 16 GB are shared with the GPU: lower there, with RX_VK_TEX_MAX_DIM=1024)
+        static const uint64_t skip_from = (uint64_t)(getenv("RX_VK_TEX_SKIP_MB") ? atoi(getenv("RX_VK_TEX_SKIP_MB")) : 64) << 20;
+        while (!x.sparse && astc && x.skip + 1 < x.levels && bytes_at(x.skip) > skip_from &&
                (std::max(x.width, x.height) >> x.skip) > max_dim)
             x.skip++;
         while (!x.sparse && x.skip + 1 < x.levels && bytes_at(x.skip) > max_bytes) x.skip++;
@@ -1574,9 +1650,12 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         const VkFormat raw = bpb == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT;
         VkImageFormatProperties limits{};
+        // (asked without STORAGE: AMD's driver checks that against the compressed format and says no, though it makes
+        // the image and its raw views (RX 6600 XT, amdvlk); without them the game's BC encoders wrote nowhere and
+        // Link's clothes showed stale blocks. If the image is then refused, it is made again without)
         if ((format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) &&
             vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
-                x.usage | VK_IMAGE_USAGE_STORAGE_BIT, flags, &limits) == VK_SUCCESS)
+                x.usage, flags, &limits) == VK_SUCCESS)
             x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     }
     if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
@@ -1630,7 +1709,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.imageGranularity.width, x.sparse_req.formatProperties.imageGranularity.height,
              x.sparse_req.imageMipTailFirstLod, (unsigned long long)(x.sparse_req.imageMipTailSize >> 10),
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
-    } else if (!create_image(ci, x.image, x.allocation)) {
+    } else if (!create_image(ci, x.image, x.allocation) &&
+               !((ci.usage & VK_IMAGE_USAGE_STORAGE_BIT) && (is_bc(x.format) || is_astc(x.format)) &&
+                 (ci.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT, x.usage = ci.usage, create_image(ci, x.image, x.allocation)))) {
         static int logged;
         if (logged++ < 16)
             logf("vk: image %ux%ux%u x%u levels %u format %d (NVN %#x) not made", x.width, x.height, x.depth, x.layers,
@@ -1648,6 +1729,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
+    InitRedirect redirect;   // (a parallel replay's worker: into the earliest open segment's init command buffer)
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1683,6 +1765,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         vkCmdPipelineBarrier2(cmd, &di);
     }
     Texture* p = tex.get();
+    redirect.done();
     static uint32_t ids;
     p->id = ++ids;
     p->first_seen = frame_no;
@@ -1771,6 +1854,7 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     rec_value = value;
     up_used = false;
     memory_table_begin();
+    memory_rb_recording_begun();   // (which readback pages its uploads may refresh: memory_rb_refresh)
 }
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();
@@ -1796,7 +1880,7 @@ unsigned view_layer(const nvn_view* v) {
 }
 
 Texture* texture_get(const nvn_tex* t, bool for_sampling) {
-    PROF(PROF_TEXGET);
+    PROF_HOT(PROF_TEXGET);
     if (!t || !t->gpu || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return nullptr;
     const VkFormatInfo fi = vk_format(t->d.format);
     if (fi.format == VK_FORMAT_UNDEFINED) {
@@ -1941,12 +2025,24 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // was unswizzled from that memory: 55 MB for the 3072 x 3072 x 3 shadow map, frame after frame. Not "storage
     // the write watch never saw written": the game fills memory before it makes a pool of it.)
     static const bool upload_all = getenv("RX_VK_UPLOAD_ALL") != nullptr;   // (A/B: such storage uploaded too)
-    const uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
+        std::lock_guard lk(from_memory_mu);
+        auto e = evicted_from_memory.find(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format));
+        if (e != evicted_from_memory.end() && e->second == tex->guest_size) {
+            evicted_from_memory.erase(e);
+            owned = 0;
+            const uint64_t n = ++st_remade_uploaded;
+            if (n <= 20 || n % 100 == 0)
+                logf("vk: texture #%u %#llx %ux%u NVN %#x evicted, made again over storage render targets took: uploaded from "
+                     "the game's memory (%llu so far)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height,
+                     tex->nvn_format, (unsigned long long)n);
+        }
+    }
     watch_tex(tex, owned ? "sampled, over rendered storage" : "sampled, uploaded");
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
         tex->upload_gen = gen;
-        st_never_written++;
         watch_tex(tex, "NOT uploaded (over storage the GPU rendered)");
         if (remade_log_on()) {   // (made again after its eviction, and sampled empty)
             std::lock_guard lk(evicted_mu);
@@ -2584,6 +2680,23 @@ void texture_set_segment(uint64_t seg) {
 uint64_t texture_segment() {
     return tl_seg;
 }
+void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n) {
+    std::lock_guard lk(seg_init_mu);
+    seg_inits.assign(n, SegInit{});
+    for (size_t i = 0; i < n; i++) seg_inits[i].cmd = init_cmds[i], seg_inits[i].open = true;
+}
+void texture_segment_worker(int index) {
+    tl_seg_index = index;
+}
+int texture_segment_end(int index) {
+    std::lock_guard lk(seg_init_mu);
+    if (index < 0 || index >= (int)seg_inits.size()) return 0;
+    SegInit& s = seg_inits[index];
+    s.open = false;   // (no new image's change goes to it from here: it is ended)
+    if (s.used) full_barrier(s.cmd);   // (before its uploads and its commands)
+    if (vkEndCommandBuffer(s.cmd) != VK_SUCCESS) return s.used ? -1 : 0;
+    return s.used ? 1 : 0;
+}
 bool texture_marked(const Texture* tex) {
     return !tex || (tex->gpu_written && !tex->released && tex->uploaded && tex->owned_frame == frame_no &&
                     tex->first_render_frame);
@@ -3170,6 +3283,11 @@ void texture_frame(uint64_t completed) {
         }
         if (shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
+        if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
+            std::lock_guard lk(from_memory_mu);
+            if (evicted_from_memory.size() > 50000) evicted_from_memory.clear();   // (a bound)
+            evicted_from_memory[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = tex->guest_size;
+        }
         if (remade_log_on()) {
             std::lock_guard lk(evicted_mu);
             if (evicted_at.size() > 20000) evicted_at.clear();   // (a bound: only the recent ones matter)

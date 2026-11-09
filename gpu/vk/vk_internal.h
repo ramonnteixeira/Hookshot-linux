@@ -30,6 +30,9 @@ extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
 void queue_flush();          // (the same, taking dev.present_mu)
+// (hookshot) held submits out, then vkDeviceWaitIdle with the present queue's lock taken too (dev.present_mu held): the device's
+// every queue is synchronized by the host around it
+void device_wait_idle_locked();
 
 struct Device {
     VkInstance instance = VK_NULL_HANDLE;
@@ -70,6 +73,11 @@ struct Device {
     std::vector<VkSemaphore> swap_rendered;   // present waits belong to acquired images, not frame slots
     std::mutex present_mu;   // (the swapchain: presents and resizes)
     std::atomic<uint64_t> swap_resize{0};   // (a new window size, width << 32 | height: the next present makes the swapchain)
+    // (hookshot) a queue of a compute family for vkQueuePresentKHR alone (vk_main.cpp create_device; RX_VK_PRESENT_QUEUE=0 / 1).
+    // VK_NULL_HANDLE: presents go on `queue` under present_mu. Its own lock: taken after present_mu, never before it
+    VkQueue present_queue = VK_NULL_HANDLE;
+    std::mutex present_queue_mu;
+    uint32_t present_family = 0;   // (present_queue's family, the swapchain's images shared with it)
 };
 extern Device dev;
 
@@ -181,6 +189,10 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
+void memory_rb_recording_begun();   // (hookshot) at a recording's start, on its thread: the submission it joins (memory_rb_refresh)
+void memory_rb_segments_begin(uint64_t base, uint64_t n);   // (and a parallel replay's segments: their order, base on)
+/// (hookshot) a range a program may write in the mirror that is not bound as written (not copied back): memory_rb_refresh
+void memory_note_gpu_write(uint64_t gpu, uint64_t size);
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
 void vk_timeline_wait(uint64_t v);
@@ -233,6 +245,10 @@ bool prepare_is_update();
 void prepare_background();
 void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
+/// (hookshot) The window was closed while the shaders were prepared: prepare_run and precompile_run take nothing more and return,
+/// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
+void prepare_stop();
+bool prepare_stopped();
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 
 } // namespace mkwvk
@@ -277,11 +293,60 @@ inline int64_t prof_now() {
     static const int64_t freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
     return perf_ticks_to_ns(t.QuadPart, freq);
 }
+// (hookshot) The per-draw phases (PROF_HOT) run a few thousand times a frame, and each timer is two counter reads: ~25k
+// reads a frame were ~2% of the replay thread. One draw in eight is timed, picked at random per thread, and counted eight
+// times: the outermost PROF_HOT on the thread picks, and those nested in it follow, so a phase never reads more than the
+// one around it. What is slow and rare inside (a program or pipeline made, a texture created or uploaded, a wait) is timed
+// by PROF / PROF_EXACT and counted once as it is, sampled draw or not: the PROF_HOT scopes around it weigh only the rest.
+// Every scope timed (prof_full): RX_VK_PROF_ALL=1, RX_VK_SLOW_LOG, and while RX_VK_BENCH replays its frame.
+inline std::atomic<int> prof_full{getenv("RX_VK_PROF_ALL") || getenv("RX_VK_SLOW_LOG") ? 1 : 0};
+struct ProfThread {
+    uint32_t rng;    // (xorshift32, seeded at the thread's first pick)
+    int open, k;     // (the PROF_HOT scopes open, and the outermost one's weight: 0 not timed)
+    int64_t exact;   // (the nanoseconds PROF / PROF_EXACT timed on this thread so far)
+};
+inline thread_local ProfThread prof_t;
 struct ProfScope {
-    int phase;
-    int64_t t0;
-    explicit ProfScope(int p) : phase(p), t0(prof_now()) {}
-    ~ProfScope() { prof_ns[phase] += prof_now() - t0; }
+    int phase;   // (-1: PROF_EXACT, no phase of its own)
+    int64_t t0, x0;
+    explicit ProfScope(int p) : phase(p), t0(prof_now()), x0(prof_t.exact) {}
+    ~ProfScope() {
+        const int64_t dt = prof_now() - t0;
+        if (phase >= 0) prof_ns[phase] += dt;
+        prof_t.exact = x0 + dt;   // (what was exact inside is part of dt: not counted twice)
+    }
+};
+/// A thread's first state: splitmix64 of a counter, so the threads' sequences are unrelated; never 0, xorshift's fixed point
+inline uint32_t prof_seed() {
+    static std::atomic<uint64_t> threads{0};
+    uint64_t z = (threads.fetch_add(1, std::memory_order_relaxed) + 1) * 0x9E3779B97F4A7C15ull;
+    z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ z >> 27) * 0x94D049BB133111EBull;
+    return (uint32_t)((z ^ z >> 31) >> 32) | 1u;
+}
+inline int prof_pick(ProfThread& t) {   // (the weight: 8 one time in eight, else 0; 1 when every scope is timed)
+    if (prof_full.load(std::memory_order_relaxed)) return 1;
+    if (!t.rng) t.rng = prof_seed();
+    t.rng ^= t.rng << 13, t.rng ^= t.rng >> 17, t.rng ^= t.rng << 5;
+    return t.rng >> 29 ? 0 : 8;   // (the top bits: xorshift's low ones are its weakest)
+}
+struct ProfScopeHot {
+    int phase, k;
+    int64_t t0, x0;
+    explicit ProfScopeHot(int p) : phase(p) {
+        ProfThread& t = prof_t;
+        if (!t.open++) t.k = prof_pick(t);
+        k = t.k, x0 = t.exact, t0 = k ? prof_now() : 0;
+    }
+    ~ProfScopeHot() {
+        ProfThread& t = prof_t;
+        const int64_t x = t.exact - x0;   // (timed exactly inside: once, as it is)
+        if (k) prof_ns[phase] += (prof_now() - t0 - x) * k + x;
+        else if (x) prof_ns[phase] += x;
+        t.open--;
+    }
 };
 } // namespace mkwvk
 #define PROF(phase) ::mkwvk::ProfScope prof_scope_##phase(::mkwvk::phase)
+#define PROF_HOT(phase) ::mkwvk::ProfScopeHot prof_scope_##phase(::mkwvk::phase)   // (the per-draw phases: sampled, above)
+#define PROF_EXACT() ::mkwvk::ProfScope prof_scope_exact(-1)   // (a slow, rare path inside them: timed exactly, above)

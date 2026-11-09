@@ -11,8 +11,10 @@
 // choice's or an amount's left or right half, Left or Right) and a right click goes back. vk_menu_hit.h has the layout.
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,6 +23,7 @@
 #include "vk_menu.h"
 #include "vk_menu_hit.h"
 #include "oot_cheat_items.h"
+#include "vk_startup_paint.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -47,12 +50,22 @@ struct Row {
     int lo, hi, step;
     const char* (*text)(int v);
     const char* help;   // (shown under the list while the row is selected)
+    bool preset_exempt = false;   // (a change here leaves the Quality preset alone: the controls, the window, the counter)
 };
 const char* tx_framegen(int v) {
     static const char* t[] = {"Off", "", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+// (hookshot) Motion controls: the choice, and whether a connected controller has a gyroscope (host/pad_sdl.c). Either can be
+// chosen whatever is connected: a pad plugged in later is read when it comes
+const char* tx_gyro(int v) {
+    const int status = host && host->gyro_status ? host->gyro_status() : -1;
+    if (status == 2) return v ? "On (gyro found)" : "Off (gyro found)";
+    if (status == 1) return v ? "On (no gyro on this pad)" : "Off (no gyro on this pad)";
+    if (status == 0) return v ? "On (no controller)" : "Off (no controller)";
+    return v ? "On" : "Off";
+}
 const char* tx_mousecam(int v) { return v ? "Native" : "As the stick"; }
 const char* tx_sens(int v) {
     static char b[12];
@@ -74,9 +87,19 @@ const char* tx_percent(int v) {
 struct Out {
     uint32_t w, h;
 };
+constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}};
+constexpr int kLastOutput = std::size(kOutputs) - 1;
+int output_choice(int v) { return v >= 0 && v <= kLastOutput ? v : 0; }
+// Display the sizes from smallest to largest while keeping the IDs used by saved settings.
+constexpr int kOutputOrder[] = {3, 0, 1, 2};
+static_assert(std::size(kOutputOrder) == std::size(kOutputs));
+int step_output_choice(int id, int dir) {
+    const int* pos = std::find(std::begin(kOutputOrder), std::end(kOutputOrder), output_choice(id));
+    const int next = std::clamp((int)(pos - std::begin(kOutputOrder)) + dir, 0, kLastOutput);
+    return kOutputOrder[next];
+}
 Out shown_output() {
-    static const Out t[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}};
-    return opts.handheld ? Out{1536, 864} : t[std::min(std::max(opts.output_res, 0), 2)];
+    return opts.handheld ? Out{1536, 864} : kOutputs[output_choice(opts.output_res)];
 }
 constexpr int kResPercent[] = {0, 100, 75, 67, 50};
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
@@ -97,8 +120,11 @@ const char* tx_resolution(int v) {
     return b;
 }
 const char* tx_output_res(int v) {
-    static const char* t[] = {"2048x1152 (game, restart)", "2560x1440 (restart)", "3840x2160 (restart)"};
-    return t[v];
+    static char b[48];
+    v = output_choice(v);
+    const Out o = kOutputs[v];
+    snprintf(b, sizeof b, "%ux%u (%srestart)", o.w, o.h, v ? "" : "game, ");
+    return b;
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
 const char* tx_text_speed(int v) {
@@ -121,6 +147,38 @@ const char* tx_gpu(int v) {
     return buf;
 }
 const char* tx_pad_layout(int v);
+// (hookshot) the Microphone row: Off, the system's default, or one of the host's microphones (host/nn_audio_in.c: the
+// ocarina's input streams), told to the host by its name (host->mic_select) whenever it changes. The chosen one is kept by
+// its name, mic_want, also while it is unplugged: the row then has one more entry for it, "<name> (not connected)", the
+// host lets the default stand in and opens it again once it is back, and the name stays in the ini. In the ini the name is
+// cut to kMicNameKept bytes (at a character's start), so the line fits the 80-byte readers of the file (host/nn_hid.c,
+// nn_applet.c, hos_main.c), and a name is matched by that much of it
+constexpr int kMaxMics = 16;
+constexpr size_t kMicNameKept = 60;
+std::string mic_want;      // (the chosen microphone's name, cut to kMicNameKept; empty: Off or the default chosen)
+bool mic_missing = false;  // (mic_want is not plugged in: the row's last entry, 2 + mic_listed, stands for it)
+int mic_listed = 0;        // (the microphones as the host last listed them)
+bool can_mic() { return host && host->mic_count && host->mic_name && host->mic_select; }
+std::string mic_key(const char* name) {
+    std::string k(name ? name : "");
+    if (k.size() <= kMicNameKept) return k;
+    size_t cut = kMicNameKept;
+    while (cut > 0 && ((unsigned char)k[cut] & 0xC0) == 0x80) cut--;   // (not in the middle of a UTF-8 character)
+    return k.substr(0, cut);
+}
+const char* tx_mic(int v) {
+    static char buf[160];
+    if (v <= 0) return "Off";
+    if (v == 1) return "Default";
+    if (mic_missing && v == 2 + mic_listed) {
+        snprintf(buf, sizeof buf, "%s (not connected)", mic_want.c_str());
+        return buf;
+    }
+    const char* n = can_mic() ? host->mic_name(v - 2) : "";
+    snprintf(buf, sizeof buf, "%s", n && *n ? n : "Microphone");
+    return buf;
+}
+const char* tx_rumble(int v) { return v ? tx_percent(v) : "Off"; }
 const char* tx_robust(int v) {
     static const char* t[] = {"Auto (restart)", "Off (restart)", "On (restart)"};
     return (unsigned)v < 3 ? t[v] : t[0];
@@ -172,9 +230,9 @@ Row rows[] = {
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
      "Automatically configures resolution, upscaling, frame generation, and dynamic VRAM limits tailored to your GPU tier."},
     {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
-     "Fills the whole screen with the game, without the window's border. The same as F11."},
+     "Fills the whole screen with the game, without the window's border. The same as F11.", true},
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
-     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart."},
+     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart.", true},
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes extra frames between the game's own (2x up to 8x), for smoother motion. Adds a little input delay, and fast motion or camera cuts "
      "can show artifacts."},
@@ -183,7 +241,7 @@ Row rows[] = {
     {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
      "faster."},
-    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, 2, 1, tx_output_res,
+    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
      "The size the game draws its whole frame at, HUD included, before it is scaled to your window. The 3D is drawn at the "
      "Resolution percentage of it. Docked only. Applies after a restart."},
     {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
@@ -200,30 +258,46 @@ Row rows[] = {
 
     // Gameplay (3 rows)
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
-     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
+     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate.", true},
     {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed,
      "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
      "longer steps."},
     {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear. Normal is the game's own pace, with its pauses. Instant shows "
      "each page at once, as pressing A does."},
+    {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
+     "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming). Default follows "
+     "Windows' default recording device. Windows must allow desktop apps to use the microphone.", true},
 
-    // Controls (8 rows)
+    // Controls (14 rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
      "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
      "apps. The keyboard and mouse still need the game's window."},
     {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam,
      "Native: the captured mouse turns the camera itself, one to one, as in a PC game. As the stick: the mouse stands in for "
-     "the right stick, with its curve and top speed."},
+     "the right stick, with its curve and top speed.", true},
     {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
      "How far the camera turns for a given mouse movement, for either Mouse camera. At 1.00 native look turns a tenth of a "
-     "degree a count. The - and = keys change it in the game too."},
+     "degree a count. The - and = keys change it in the game too.", true},
     {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff,
-     "Swaps up and down for the mouse: moving it forward tilts the camera down."},
+     "Swaps up and down for the mouse: moving it forward tilts the camera down.", true},
     {TAB_CONTROLS, "Invert camera X", &opts.invert_cam_x, 0, 1, 1, tx_onoff,
-     "Inverts horizontal look (left/right) on the right analog stick."},
+     "Inverts horizontal look (left/right) on the right analog stick.", true},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
-     "Inverts vertical look (up/down) on the right analog stick."},
+     "Inverts vertical look (up/down) on the right analog stick.", true},
+    {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
+     "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", true},
+    {TAB_CONTROLS, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
+     "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch. Works with Switch Pro "
+     "controllers and pads in Switch mode, DualSense and DualShock 4. Shown beside it: whether the connected pad has one."},
+    {TAB_CONTROLS, "Motion sensitivity X", &opts.gyro_sens_x, 10, 300, 10, tx_percent,
+     "How far the aim moves left and right for a given turn of the controller. 100% is the console's own.", true},
+    {TAB_CONTROLS, "Motion sensitivity Y", &opts.gyro_sens_y, 10, 300, 10, tx_percent,
+     "How far the aim moves up and down for a given tilt of the controller. 100% is the console's own.", true},
+    {TAB_CONTROLS, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff,
+     "Turns the motion aim's left and right around.", true},
+    {TAB_CONTROLS, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff,
+     "Turns the motion aim's up and down around.", true},
     {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
@@ -363,7 +437,11 @@ bool mouse_read = false;   // (the menu has read the mouse since it opened)
 // (the Cheats page's and the list pages' record of each shown row's or line's value's left edge: the menu's width, none)
 int cheat_value_l[kCheatRows];
 int list_value_l[kTeleportLines];
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens; }
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+/// (a scale: the arrows, a click and the wheel stop at its ends; Rumble strength would go from Off to its strongest)
+bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y; }
+/// (the ini's Rumble strength on the menu's steps: 0 to 150, the nearest 25)
+int rumble_step(int v) { return (std::min(std::max(v, 0), 150) + 12) / 25 * 25; }
 std::string ini_path() {
     char exe[MAX_PATH];
     const DWORD n = game_module_path(exe, MAX_PATH);
@@ -417,6 +495,52 @@ int detect_pad_layout() {
     if (a == HOS_PAD_SOUTH && b == HOS_PAD_EAST && x == HOS_PAD_NORTH && y == HOS_PAD_WEST) return 2;
     return 3;
 }
+// (hookshot) the row's choice to the host: off, the default, or a microphone by its name (and its place in the host's list,
+// -1 while it is unplugged: of two with one name, the one chosen). Unplugged, the name is the kept one, cut: the host takes
+// a name that starts with it
+void mic_tell_host() {
+    if (!can_mic()) return;
+    if (opts.mic <= 1) host->mic_select(opts.mic <= 0 ? 0 : 1, "", -1);
+    else if (mic_missing && opts.mic == 2 + mic_listed) host->mic_select(2, mic_want.c_str(), -1);   // (the kept name, cut)
+    else host->mic_select(2, host->mic_name(opts.mic - 2), opts.mic - 2);   // (its whole name: the ini's cut is only the ini's)
+}
+void mic_row_ends() {
+    for (Row& r : rows)
+        if (r.value == &opts.mic) r.hi = 1 + mic_listed + (mic_missing ? 1 : 0);
+}
+// (hookshot) the microphones listed again (one plugged in since shows up), the row on mic_want's: the one at the row's place
+// when it still has that name (two microphones of one name: the second stays chosen), else the first of that name, else
+// its "(not connected)" entry while it is unplugged
+void refresh_mics() {
+    if (!can_mic()) {
+        if (opts.mic >= 2) opts.mic = 1;
+        return;
+    }
+    mic_listed = std::min(host->mic_count(), kMaxMics);
+    int at = -1;
+    if (!mic_want.empty()) {
+        if (opts.mic >= 2 && opts.mic - 2 < mic_listed && mic_key(host->mic_name(opts.mic - 2)) == mic_want) at = opts.mic - 2;
+        for (int i = 0; i < mic_listed && at < 0; i++)
+            if (mic_key(host->mic_name(i)) == mic_want) at = i;
+        opts.mic = at >= 0 ? at + 2 : 2 + mic_listed;
+    } else if (opts.mic >= 2) {
+        opts.mic = 1;
+    }
+    mic_missing = !mic_want.empty() && at < 0;
+    mic_row_ends();
+    mic_tell_host();
+}
+// (the row changed by the player: the choice is now this one, by its name; the "(not connected)" entry is kept only while
+// it is the one chosen)
+void mic_chosen() {
+    if (opts.mic >= 2 && !(mic_missing && opts.mic == 2 + mic_listed)) {
+        mic_want = mic_key(host->mic_name(opts.mic - 2)), mic_missing = false;
+    } else if (opts.mic < 2) {
+        mic_want.clear(), mic_missing = false;
+    }
+    mic_row_ends();
+    mic_tell_host();
+}
 void save() {
     // (hookshot) the lines that are not the menu's are kept: the controls, pad_ and key_ (host/nn_hid.c)
     std::string kept;
@@ -429,6 +553,7 @@ void save() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         for (const Row& r : rows)
             if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
+        if (!mic_want.empty()) fprintf(f, "microphone_device=%s\n", mic_want.c_str());   // (hookshot: also while it is unplugged)
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load)
         fprintf(f, "options_version=3\n");
@@ -444,8 +569,12 @@ void save() {
 /// A row's new value v, as the arrows set it (dir: 1 up, -1 down, for the rows that skip or wrap), saved unless !keep
 /// (a slider's drag: saved once it is let go)
 void set_row(Row& r, int v, int dir, bool keep = true) {
+    if (r.value == &opts.output_res) {
+        v = step_output_choice(*r.value, dir);
+        if (v == *r.value) return;
+    }
     if (r.value == &opts.framegen && v == 1) v = dir > 0 ? 2 : 0;   // (off, 2x ... 8x)
-    if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
+    if (stops_at_ends(r)) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
     if (r.value == &opts.pad_layout) {
         if (v > 2) v = dir > 0 ? 0 : 2;
         if (v < 0) v = 2;
@@ -456,13 +585,12 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         apply_preset(*r.value);
     } else {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-        if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
-            r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
-            r.value != &opts.mouse_sens && r.value != &opts.mouse_invert) {   // (the controls are not the preset's)
+        if (!r.preset_exempt) {   // (the controls, the window and the counter are not the preset's)
             opts.preset = 0; // Custom
             sync_preset_budgets(0);
         }
     }
+    if (r.value == &opts.mic && can_mic()) mic_chosen();   // (hookshot)
     if (keep) save();
 }
 
@@ -575,6 +703,7 @@ Bitmap menu_bmp, fps_bmp;
 std::mutex bmp_mu;
 int scale_of(uint32_t h) { return std::max(1u, h / 720); }
 
+thread_local uint32_t* paint_bits = nullptr;   // (the bitmap being drawn, for a paint that writes pixels itself)
 void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, uint32_t, int), int scale) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof bi.bmiHeader;
@@ -588,7 +717,9 @@ void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, 
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!bmp) { DeleteDC(dc); return; }
     HGDIOBJ old = SelectObject(dc, bmp);
+    paint_bits = (uint32_t*)bits;   // (the start-up screen blends its logo in: vk_startup_paint.h)
     paint(dc, w, h, scale);
+    paint_bits = nullptr;
     GdiFlush();
     if (const char* dir = &out == &menu_bmp ? getenv("RX_VK_MENU_DUMP") : nullptr) {   // (test runs: each drawing of the menu, as menu_<n>.bmp)
         static int n = 0;
@@ -712,7 +843,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         for (int i = 0; i <= kControls; i++) {
             const int y = top + i * rh;
             const bool sel = i == csel;
-            if (sel) fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
+            if (sel) startup_gdi::round_rect(dc, 8 * s, y, (int)w - 16 * s, rh, 6 * s, RGB(44, 72, 54));
             SetTextColor(dc, sel ? RGB(255, 255, 255) : RGB(196, 204, 198));
             if (i == kControls) {
                 const char* t = "Reset to defaults";
@@ -762,7 +893,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
                 continue;
             }
             const int i = line - section - 1;
-            if (i == choice) fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
+            if (i == choice) startup_gdi::round_rect(dc, 8 * s, y, (int)w - 16 * s, rh, 6 * s, RGB(44, 72, 54));
             SetTextColor(dc, i == choice ? RGB(255, 255, 255) : RGB(196, 204, 198));
             const char* label = inv ? item_names[i] : teleport_names[i];
             TextOutA(dc, 32 * s, y + 3 * s, label, (int)strlen(label));
@@ -823,7 +954,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts."};
         for (int i = 0; i < kCheatRows; i++) {
             const int y = (menu_hit::kCheatTop + i * menu_hit::kCheatRowH) * s;
-            if (i == cheat_selected) fill(dc, 8 * s, y, (int)w - 16 * s, menu_hit::kCheatRowH * s, RGB(44, 72, 54));
+            if (i == cheat_selected) startup_gdi::round_rect(dc, 8 * s, y, (int)w - 16 * s, menu_hit::kCheatRowH * s, 6 * s, RGB(44, 72, 54));
             SetTextColor(dc, i == cheat_selected ? RGB(255, 255, 255) : RGB(196, 204, 198));
             TextOutA(dc, 16 * s, y + 4 * s, labels[i], (int)strlen(labels[i]));
             const char* value = values[i];
@@ -891,8 +1022,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         const int y = top + i * rh;
         const bool sel = i == tab_selected[cur_tab];
         if (sel) {
-            fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
-            fill(dc, 8 * s, y, 3 * s, rh, RGB(96, 210, 120));   // (a green marker at its left)
+            startup_gdi::round_rect(dc, 8 * s, y, (int)w - 16 * s, rh, 6 * s, RGB(44, 72, 54));
+            startup_gdi::round_fill(dc, 10 * s, y + 6 * s, 3 * s, rh - 12 * s, RGB(104, 186, 124));   // (a green marker at its left)
         }
         SetTextColor(dc, sel ? RGB(255, 255, 255) : RGB(196, 204, 198));
         TextOutA(dc, 18 * s, y + 4 * s, r.name, (int)strlen(r.name));
@@ -907,7 +1038,12 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             GetTextExtentPoint32A(dc, t.c_str(), (int)t.size(), &z);
             return (int)z.cx;
         };
-        auto framed = [&](const std::string& t) { return arrows ? "<  " + t + "  >" : t; };
+        const bool output_row = r.value == &opts.output_res;
+        const bool left_arrow = arrows && (!output_row || step_output_choice(*r.value, -1) != *r.value);
+        const bool right_arrow = arrows && (!output_row || step_output_choice(*r.value, 1) != *r.value);
+        auto framed = [&](const std::string& t) {
+            return arrows ? (left_arrow ? "<  " : "   ") + t + (right_arrow ? "  >" : "   ") : t;
+        };
         std::string v = framed(label);
         if (width(v) > room && arrows) {   // (slides: the longest piece from marquee_pos that fits)
             size_t start = label.size();   // (the last start that still shows the name's end)
@@ -1032,7 +1168,7 @@ struct Upload {
     void* map = nullptr;
     uint64_t size = 0, version = 0;
 };
-Upload ups[2][3];   // (the menu's, the counter's; a frame in flight's each)
+Upload ups[3][3];   // (the menu's, the counter's, the start-up screen's; a frame in flight's each)
 
 void copy_over(VkCommandBuffer cmd, VkImage dst, Bitmap& b, Upload& u, int x, int y, uint32_t w, uint32_t h) {
     std::lock_guard lk(bmp_mu);
@@ -1057,7 +1193,33 @@ void copy_over(VkCommandBuffer cmd, VkImage dst, Bitmap& b, Upload& u, int x, in
     vkCmdCopyBufferToImage(cmd, u.buf, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
 }
 
+// ---- (hookshot) the start-up screen (vk_startup_paint.h): centred on black ----
+StartupView startup;
+Bitmap startup_bmp;
+std::atomic<bool> startup_on{false};
+void paint_startup(HDC dc, uint32_t w, uint32_t h, int pct) { paint_startup_view(dc, w, h, pct, startup, paint_bits); }
+
 } // namespace
+
+void startup_screen(const StartupView* view) {
+    if (!view) {
+        startup_on.store(false, std::memory_order_release);
+        return;
+    }
+    static int drawn_pct = 0;
+    const int pct = startup_scale(dev.swap_extent.width, dev.swap_extent.height);
+    StartupView v = *view;
+    if (v.version.empty()) v.version = version_text(HOOKSHOT_VERSION);   // ("v2.0.5"; "v2.0.5 dev" between releases)
+    // (the bar to whole pixels: a redraw only when it moves)
+    const double span = (kStartupW - 120) * pct / 100.0;
+    if (v.fraction >= 0) v.fraction = std::floor(std::min(v.fraction, 1.0) * span) / span;
+    if (pct != drawn_pct || !(v == startup)) {
+        startup = v;
+        drawn_pct = pct;
+        gdi_draw(startup_bmp, (uint32_t)(kStartupW * pct / 100), (uint32_t)(kStartupH * pct / 100), paint_startup, pct);
+    }
+    startup_on.store(true, std::memory_order_release);
+}
 
 void menu_init() {
     static bool done;
@@ -1081,14 +1243,29 @@ void menu_init() {
             char* eq = strchr(line, '=');
             if (!eq) continue;
             *eq = 0;
-            for (Row& r : rows)
-                if (r.value && !strcmp(line, ini_key(r))) *r.value = std::min(std::max(atoi(eq + 1), r.lo), r.hi);
+            for (Row& r : rows) {
+                if (!r.value || strcmp(line, ini_key(r))) continue;
+                const int v = atoi(eq + 1);
+                *r.value = r.value == &opts.output_res ? output_choice(v) : std::min(std::max(v, r.lo), r.hi);
+            }
             has_resolution |= !strcmp(line, "resolution");
             v2 |= !strcmp(line, "options_version");
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
+            if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
+                mic_want = mic_key(eq + 1);
+                while (!mic_want.empty() && (mic_want.back() == '\n' || mic_want.back() == '\r')) mic_want.pop_back();
+            }
         }
         fclose(f);
+        // (the saved microphone by its name, not its place; the host told the row's choice. Off or the default: no list, no SDL
+        // audio at the start)
+        if (!mic_want.empty()) refresh_mics();
+        else {
+            if (opts.mic >= 2) opts.mic = 1;
+            mic_tell_host();
+        }
         if (!has_resolution && old_dynres >= 0) opts.resolution = old_dynres ? 0 : 1;
+        opts.rumble = rumble_step(opts.rumble);   // (a hand-edited 60: 50, on the arrows' steps)
         // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
         // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
         if (!v2) opts.realtime = 1;
@@ -1110,7 +1287,7 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
-    if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
+    if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = output_choice(atoi(e));
 }
 
 bool resolution_auto() { return opts.resolution == 0; }
@@ -1331,6 +1508,7 @@ void menu_tick() {
         // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
         // layout is not applied over them at start)
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
+        if (open_now.load()) refresh_mics();   // (the microphones as they are now)
     }
     if (open_now.load() && page == 1) {   // (hookshot) the Controls page
         if (!can_bind()) page = 0;
@@ -1572,11 +1750,11 @@ void menu_tick() {
                 if (hit.part == menu_hit::kTab || hit.part == menu_hit::kTabPrev || hit.part == menu_hit::kTabNext) {
                     if (ptr.wheel > 0) tab_left = true;
                     else tab_right = true;
-                } else if (on_value) {   // (over a value: it changes, up for the wheel away; a slider stops at its ends)
+                } else if (on_value) {   // (over a value: it changes, up for the wheel away; a slider or a scale stops at its ends)
                     const int dir = ptr.wheel > 0 ? 1 : -1;
                     for (int n = ptr.wheel > 0 ? ptr.wheel : -ptr.wheel; n > 0; n--) {
                         const int v = *d.value + dir * d.step;
-                        if (is_slider(d) && (v < d.lo || v > d.hi)) break;
+                        if ((is_slider(d) || stops_at_ends(d)) && (v < d.lo || v > d.hi)) break;
                         set_row(d, v, dir);
                     }
                     changed = true;
@@ -1639,7 +1817,19 @@ void menu_tick() {
 }
 
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h) {
-    if (opts.show_fps) {
+    if (startup_on.load(std::memory_order_acquire)) {   // (hookshot) under the counter and the menu
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        mb.srcAccessMask = mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
+        std::unique_lock lk(bmp_mu);
+        const uint32_t sw = startup_bmp.w, sh = startup_bmp.h;
+        lk.unlock();
+        if (sw) copy_over(cmd, dst, startup_bmp, ups[2][slot], (int)(w - sw) / 2, (int)(h - sh) / 2, w, h);
+    }
+    if (opts.show_fps && !startup_on.load(std::memory_order_relaxed)) {   // (no game frames yet: not "0 FPS" over the start-up screen)
         // The game image was just blitted (or cleared) into dst. Its write must
         // finish before the FPS pixels overwrite it; command order alone does
         // not order these transfer writes. The menu below has its own barrier.

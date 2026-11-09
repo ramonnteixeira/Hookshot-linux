@@ -15,8 +15,11 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 7
+#define MKWVK_API_VERSION 9
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
+/* (hookshot) the Controls tab's motion rows (host/pad_sdl.c reads them, vk_replay.cpp's option answers them): Motion
+   controls on or off, the horizontal's and the vertical's sensitivity in percent, and each turned around */
+enum { HOS_OPT_GYRO = 18, HOS_OPT_GYRO_SENS_X, HOS_OPT_GYRO_INV_X, HOS_OPT_GYRO_INV_Y, HOS_OPT_GYRO_SENS_Y };
 
 /* (hookshot) the controls' names (host/nn_hid.c, host/pad_sdl.c, the pad_ and key_ lines of hookshot_options.ini):
    the Switch's buttons in nn::hid's bit order, and a gamepad's inputs by position, SDL's order (the bottom face
@@ -99,6 +102,15 @@ typedef struct MkwVkHost {
        window and the window has the focus. The Insert menu releases the mouse while it is open: WM_APP + 8 to the
        window, wParam 1 open, 0 closed (the capture it had then comes back) */
     int (*pointer)(MkwVkPointer *out);
+    /* (hookshot) the microphones for the game's input streams (host/nn_audio_in.c), for the Insert menu's Microphone row:
+       how many there are (listing them again), one's name, and the row's choice: mode 0 off, 1 the system's default, 2 the
+       microphone of that name (index: its place in the list, -1 while it is not plugged in) */
+    int (*mic_count)(void);
+    const char *(*mic_name)(int index);
+    void (*mic_select)(int mode, const char *name, int index);
+    /* (hookshot) the controllers' motion sensors, for the Insert menu's Motion controls row (host/pad_sdl.c): 0 no
+       controller, 1 controllers with no gyroscope, 2 one with a gyroscope */
+    int (*gyro_status)(void);
 } MkwVkHost;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */
@@ -137,7 +149,9 @@ typedef struct MkwVkRenderer {
     /* the CPU set an event's value: in order with the submits (the GPU's waits on it) */
     void (*nvn_event_signal)(uint64_t gpu, uint32_t value);
     int (*option)(int id);   /* (hookshot, the Insert menu) 0: game time follows the clock, 1: the menu is open, 2: dynamic resolution, 3: its fixed scale in percent, 4: the controllers count behind other windows, 5: text speed (0 normal to 3 instant), 6: native mouse look (host/mouse_native.c),
-                                7: the mouse's sensitivity in percent, 8: its up and down swapped (host/nn_hid.c) */
+                                7: the mouse's sensitivity in percent, 8: its up and down swapped (host/nn_hid.c),
+                                18: motion controls from a pad's gyroscope (host/pad_sdl.c), 19 and 22: their horizontal
+                                and vertical sensitivity in percent, 20 and 21: each turned around */
     /* a submit with its queue */
     void (*nvn_submit_q)(const uint64_t *handles, int n, uint64_t queue);
     /* (hookshot) a fence of one queue: the value its own last submission signals (nvnQueueFenceSync) */

@@ -9,6 +9,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def preset_exempt(menu, value):
+    """the menu's row for opts.<value> leaves the quality preset alone (Row::preset_exempt, which set_row checks)"""
+    start = menu.index("&opts.%s," % value, menu.index("Row rows[] = {"))
+    row = menu[start:menu.index("},", start)]
+    return row.rstrip().endswith(", true") and "if (!r.preset_exempt)" in menu
+
+
 def read(*parts):
     return (ROOT.joinpath(*parts)).read_text(encoding="utf-8")
 
@@ -33,7 +40,7 @@ def main():
         raise SystemExit("HOS_MOUSE_SENS no longer wins over the menu")
     if "rx_option(8, 0)" not in hid or "rx_option(8, 0)" not in native:
         raise SystemExit("the menu's inversion is not read by both mouse paths")
-    if "r.value != &opts.mouse_sens" not in menu:
+    if not preset_exempt(menu, "mouse_sens"):
         raise SystemExit("a mouse setting turns the quality preset to Custom")
     print("PASS: the mouse's settings are the menu's")
 
