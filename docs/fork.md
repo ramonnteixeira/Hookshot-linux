@@ -13,8 +13,15 @@ alguns arquivos próprios. Desde novembro de 2026 o oficial tem suporte a Linux;
 | `.github/workflows/fork-checks.yml` | Roda o teste a cada push na `linux-port` |
 | `docs/fork.md` | Esta nota |
 
-O fork só **acrescenta** arquivos, não altera os do oficial: assim cada sincronização é um merge sem conflitos. Um
-ajuste num arquivo do oficial deve ir, de preferência, como pull request para lá.
+O fork quase só **acrescenta** arquivos: assim cada sincronização é um merge sem conflitos. Um ajuste num arquivo do
+oficial deve ir, de preferência, como pull request para lá. Por enquanto há um:
+
+| Arquivo do oficial | Ajuste |
+|---|---|
+| `gpu/vk/vk_draw.cpp` (`fallback_compute_pipelines`) | Na MX250 (Pascal, driver NVIDIA) o compilador do driver falha no pipeline de compute que substitui o mesh `a5da9f84b72d1471` (corte para a Árvore Deku, tela preta). O fork tenta de novo sem o otimizador do driver e fora do pipeline cache, e passa a respeitar `RX_VK_NOOPT=1` nesses pipelines |
+
+Se o merge com o oficial der conflito nesse arquivo, fique com a versão do oficial e reaplique o trecho (ou descarte-o,
+se o oficial já tiver resolvido).
 
 ## Atualizar com o oficial
 

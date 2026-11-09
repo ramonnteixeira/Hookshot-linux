@@ -4858,10 +4858,30 @@ bool fallback_compute_pipelines(Program& p) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
         ci.layout = p.layout;
+        // (RX_VK_NOOPT=1 covers these as the other pipelines)
+        static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
+        if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {
-            static std::atomic<int> told{0};
-            if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
-            return false;
+            // (one more try without the driver's optimizer and outside the pipeline cache: on an MX250 (Pascal, Linux) NVIDIA's
+            // compiler faults on the fallback of OoT's mesh a5da9f84b72d1471 at the cut to the Deku Tree, and the cutscene never
+            // starts; AMD's crashes and hangs on task and mesh programs went away the same way, built unoptimized (PR 430))
+            VkResult again = VK_ERROR_UNKNOWN;
+            made[i] = VK_NULL_HANDLE;
+            if (!(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+                ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                again = guarded_compute(VK_NULL_HANDLE, &ci, &made[i]);
+            }
+            if (again != VK_SUCCESS) {
+                static std::atomic<int> told{0};
+                if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
+                for (VkPipeline& m : made)
+                    if (m) vkDestroyPipeline(dev.device, m, nullptr), m = VK_NULL_HANDLE;
+                return false;
+            }
+            static std::atomic<int> told_unopt{0};
+            if (told_unopt++ < 4)
+                logf("vk: fallback: the compute pipeline of %016llx made without the driver's optimizer (it faulted with it)",
+                     (unsigned long long)p.key);
         }
         pcache_built_since_save++;
     }
