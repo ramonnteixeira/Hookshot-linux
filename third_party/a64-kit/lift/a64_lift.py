@@ -211,6 +211,201 @@ def stack_stores(text):
     return SP_STORE.sub(r"recomp_\1_sp(c,\2c->x[31]", text)
 
 
+# Page marks per group (A2). In a straight-line run of a function's C the marked stores through the same base register
+# plus a constant keep their data stores but share one A64_MARK(base + lo, hi - lo) for their byte span [lo, hi) (when it
+# is at most 4 KB), placed after the group's last store and before the first later line that writes the base register or
+# ends the run. The pages marked are the same: every store of the group lies in [base+lo, base+hi), at most two pages,
+# which the stores at lo and ending at hi mark themselves. Each data store is still followed, in program order and before
+# any guest synchronisation, by a release store of a mark of its page, so a collection that clears the mark sees the data
+# (rt/a64.h A64_MARK).
+# It runs on the finished C files, last (nx2/lift.py: after nx2/oot_patches.py and every other edit of the lifted text,
+# which match the lift's exact text), so it is not part of emit_function, and the kit's own write() leaves it out: a
+# lift without nx2 keeps a mark per store unless it calls group_marks itself. A64_MARK_EACH=1 at lift time: a mark per
+# store. Running it again changes nothing (its own marks are recognised, and are not run ends).
+# A run ends at anything not shown to be straight-line code without synchronisation: a label, goto, return, a line
+# whose braces do not balance (a multi-line block opens or closes: a mark never moves into or out of one), STLR / LDAR
+# in suyu's spelling (a plain recomp_storeN(c,c->x[N],...) / recomp_loadN(c,c->x[N])), the register file as a whole,
+# a local register (A64_LOCAL_REGS), and every call-like token but MG_PLAIN's: calls (f_*, TAILCALL, hos_* from the
+# patches), polls, atomics, barriers, exclusives, SVCs, traps and any helper this list does not know.
+MG_STORE = re.compile(r"recomp_(store8|store16|store32|store64|stp32|stp64)\(c,")
+MG_SIZE = {"store8": 1, "store16": 2, "store32": 4, "store64": 8, "stp32": 8, "stp64": 16}
+# address forms (the text right after "recomp_X(c,")
+MG_ADDR = [
+    (re.compile(r"c->x\[(\d+)\] \+ (-?\d+),"), "x"),          # c->x[N] + IMM,
+    (re.compile(r"\(c->x\[(\d+)\]\+(\d+)ULL\),"), "x"),        # (c->x[N]+IMMULL),
+    (re.compile(r"\(_b\+_o\)\+(\d+),"), "bo+"),                # (_b+_o)+IMM,
+    (re.compile(r"\(_b\+_o\),"), "bo"),                        # (_b+_o),
+    (re.compile(r"_b,"), "b"),                                 # _b,
+    (re.compile(r"_a\+(\d+),"), "a+"),                         # _a+IMM,
+    (re.compile(r"_a,"), "a"),                                 # _a,
+]
+MG_BDEF = re.compile(r"uint64_t _b=c->x\[(\d+)\]; int64_t _o=(-?\d+);")
+MG_ADEF = re.compile(r"uint64_t _a=c->x\[(\d+)\];")
+# (call-like tokens that are plain: keywords, guest loads and stores without ordering (the stores are what is grouped),
+# and helpers that only compute or move values between locals, registers and vector registers)
+MG_PLAIN = re.compile(r"(?:if|for|while|sizeof|memcpy|memset|UINT64_C|INT64_C|fabsf|fabs|__builtin_add_overflow|"
+                      r"recomp_(?:load|ldp|store|stp)(?:8|16|32|64)(?:_sp)?|"
+                      r"recomp_(?:fixed_to_fp|fp_to_fixed|fp_to_int|fp_estimate|umulh|smulh|aes_sbox)|"
+                      r"a64_(?:vset64|vset128|vset_lo|vst16|fcmp32|fcmp64|vfcmp)|a64_v?fpx_\w+)\Z")
+MG_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_mg_plain = {}
+# (the other run ends: a label, goto, return, STLR and LDAR, the register file as a whole)
+MG_END = re.compile(r"^\s*L_[0-9a-f]+:|\bgoto\b|\breturn\b|recomp_(?:store|stp)\d+\(c,c->x\[\d+\],|"
+                    r"recomp_load\d+\(c,c->x\[\d+\]\)|c->x(?!\[)")
+MG_LOCAL = re.compile(r"\bx\d+_ = c->x\[")   # (localize_regs's locals: such a function is left as it is)
+MG_BRACE = re.compile(r"[{}]")
+# a line whose stores may not all run, or run more than once: its stores keep their own marks
+MG_NOT_STRAIGHT = re.compile(r"\bif\b|\?|\bfor\b|\bwhile\b|\bswitch\b|\bcase\b")
+MG_NOT_STRAIGHT_WORDS = ("if", "?", "for", "while", "switch", "case")
+MG_MARK = "    A64_MARK((c->x[%d] + (uint64_t)(int64_t)(%d)), %d);"
+MG_OWN_MARK = re.compile(r"    A64_MARK\(\(c->x\[\d+\] \+ \(uint64_t\)\(int64_t\)\(-?\d+\)\), \d+\);\Z")
+MG_HEAD = re.compile(r"\nvoid f_[0-9a-f]+\(")   # (a definition or declaration: its line begins after the newline)
+
+
+def mg_balanced(line):
+    """the line's braces close what it opens, in order (a block on one line, or none)"""
+    if "{" not in line and "}" not in line:
+        return True
+    d = 0
+    for b in MG_BRACE.findall(line):
+        d += 1 if b == "{" else -1
+        if d < 0:
+            return False
+    return d == 0
+
+
+def mg_ends_run(line):
+    """the line ends a straight-line run (each test only on a line that has its text: this runs on most lines of the lift)"""
+    if ("{" in line or "}" in line) and not mg_balanced(line):
+        return True
+    if "(" in line:
+        for t in MG_CALL.findall(line):
+            p = _mg_plain.get(t)
+            if p is None:
+                p = _mg_plain[t] = MG_PLAIN.match(t) is not None
+            if not p:
+                return True
+    if "goto" in line or "return" in line or "L_" in line or "(c,c->x[" in line or line.count("c->x") != line.count("c->x["):
+        return MG_END.search(line) is not None
+    return False
+
+
+def mg_parse_store(line, m):
+    """(base register, offset, size) of the marked store at match m, or None"""
+    rest = line[m.end():]
+    size = MG_SIZE[m.group(1)]
+    for rx, kind in MG_ADDR:
+        a = rx.match(rest)
+        if not a:
+            continue
+        if kind == "x":
+            return int(a.group(1)), int(a.group(2)), size
+        d = None   # (the nearest definition before the store)
+        for d in (MG_BDEF if kind in ("bo", "bo+", "b") else MG_ADEF).finditer(line, 0, m.start()):
+            pass
+        if d is None:
+            return None
+        if kind in ("bo", "bo+", "b"):
+            off = 0 if kind == "b" else int(d.group(2)) + (int(a.group(1)) if kind == "bo+" else 0)
+            return int(d.group(1)), off, size
+        return int(d.group(1)), (int(a.group(1)) if kind == "a+" else 0), size
+    return None
+
+
+def mark_groups_lines(lines, st):
+    """the lines of a function (or of any C text) with the page marks of each group shared"""
+    inserts = {}    # line index -> mark lines to put before it
+    unmark = {}     # line index -> set of match start offsets to turn into _sp
+    groups = {}     # base register -> [(line index, match start, off, size)]
+
+    def flush(reg, at):
+        g = groups.pop(reg, None)
+        if not g:
+            return
+        lo = min(o for _, _, o, _ in g)
+        hi = max(o + n for _, _, o, n in g)
+        st["stores"] += len(g)
+        if len(g) < 2 or hi - lo > 4096:
+            return
+        for li, ms, _, _ in g:
+            unmark.setdefault(li, set()).add(ms)
+        inserts.setdefault(at, []).append(MG_MARK % (reg, lo, hi - lo))
+        st["groups"] += 1
+        st["grouped_stores"] += len(g)
+
+    for i, line in enumerate(lines):
+        if not groups and "recomp_st" not in line:
+            continue   # (nothing to end or to add to)
+        if line.startswith("    A64_MARK((") and MG_OWN_MARK.match(line):
+            continue
+        if mg_ends_run(line):
+            for r in list(groups):
+                flush(r, i)
+            continue
+        writes = {int(a or b) for a, b in REG_WRITE.findall(line)} if (
+            "=" in line or "&c->x" in line or "++" in line or "--" in line) else ()
+        stores = list(MG_STORE.finditer(line)) if "recomp_st" in line else ()
+        if stores and not writes and not (any(w in line for w in MG_NOT_STRAIGHT_WORDS) and MG_NOT_STRAIGHT.search(line)):
+            for m in stores:
+                p = mg_parse_store(line, m)
+                if p is None or p[0] == 31:
+                    continue   # (an address this pass does not follow, or SP: the store keeps what it has)
+                groups.setdefault(p[0], []).append((i, m.start(), p[1], p[2]))
+            continue
+        for r in writes:   # (the base changes here: its group's mark goes before this line)
+            if r in groups:
+                flush(r, i)
+    for r in list(groups):
+        flush(r, len(lines))
+    if not unmark:
+        return lines
+    out = []
+    for i, line in enumerate(lines):
+        out.extend(inserts.get(i, []))
+        if i in unmark:
+            for ms in sorted(unmark[i], reverse=True):
+                m = MG_STORE.match(line, ms)
+                line = line[:m.start()] + "recomp_%s_sp(c," % m.group(1) + line[m.end():]
+        out.append(line)
+    out.extend(inserts.get(len(lines), []))
+    return out
+
+
+def mark_groups(text, stats=None):
+    """text (a C file of lifted functions, or one function) with the page marks of each group shared. stats: counts of
+    the stores looked at, the groups and their stores"""
+    st = stats if stats is not None else Counter()
+    for k in ("stores", "groups", "grouped_stores"):
+        st[k] = st.get(k, 0)
+    starts = [0] + [m.start() + 1 for m in MG_HEAD.finditer(text)]
+    starts.append(len(text))
+    out = []
+    for a, b in zip(starts, starts[1:]):
+        part = text[a:b]
+        if part.count("recomp_st") < 2 or len(MG_STORE.findall(part)) < 2 or (
+                "_ = c->x[" in part and MG_LOCAL.search(part)):   # (no group possible: most functions)
+            out.append(part)
+            continue
+        out.append("\n".join(mark_groups_lines(part.split("\n"), st)))
+    return "".join(out)
+
+
+def group_marks(paths, stats=None):
+    """mark_groups over C files, in place (nx2/lift.py: the lift's last step). A64_MARK_EACH=1: none. The files changed"""
+    if os.environ.get("A64_MARK_EACH"):
+        return 0
+    changed = 0
+    for path in paths:
+        with open(path, encoding="utf-8", newline="") as f:
+            text = f.read()
+        new = mark_groups(text, stats)
+        if new != text:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(new)
+            changed += 1
+    return changed
+
+
 # Dead flags. Each flag-setting instruction stores all of N, Z, C and V in the context, where the compiler must keep
 # them: a callee or the caller could read them. The guest's ABI says otherwise (calls clobber NZCV, and nothing reads
 # flags across a return), so emit_function computes per function which flags are live after each instruction and
@@ -259,7 +454,8 @@ SYNC_CALL, SYNC_BACK, SYNC_RET, SYNC_ALL, SYNC_RELOAD = "\x01C%d\x01", "\x01B%d\
 SYNC_TAIL = "\x01T%d\x01"   # (control leaving after the instruction: what it wrote too)
 SYNC_MARK = re.compile("\x01([CBRALT])(\\d+)\x01")
 REG_REF = re.compile(r"c->x\[(\d+)\]")
-REG_WRITE = re.compile(r"(?:&c->x\[(\d+)\])|(?:c->x\[(\d+)\]\s*(?:[-+*/%&|^]|<<|>>)?=(?!=))")
+# (a write of a guest register: its address taken (LDP's outputs), ++ / --, = and the compound assignments)
+REG_WRITE = re.compile(r"(?:(?:&|\+\+\s*|--\s*)c->x\[(\d+)\])|(?:c->x\[(\d+)\]\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--))")
 SCRATCH = 0xFE00   # x9-x15: dead at calls and returns
 _reg_writes = {}
 
@@ -1647,3 +1843,6 @@ class Lifter:
         if self.stats["split_entries"]:
             print("split: %d extra entries in long functions; largest function now %d instructions" % (
                 self.stats["split_entries"], max(len(b) for b, _ in self.funcs.values())))
+        if self.stats["stores"]:   # (group_marks, when the lift ran it before this report)
+            print("page marks: %d groups share one mark for %d of %d stores through a base register" % (
+                self.stats["groups"], self.stats["grouped_stores"], self.stats["stores"]))

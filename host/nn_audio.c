@@ -83,7 +83,7 @@ typedef struct {
     WB wbc[MAX_WB];                            /* and their contents when appended */
     int nwb, pending_wb;                       /* (pending: appended, not yet applied by an update) */
     uint64_t rel[MAX_REL];                     /* released, for GetReleasedWaveBuffer */
-    int nrel;
+    int nrel, nrel_seen;                       /* (seen: the first nrel_seen, released by the last update) */
     int64_t played;
     int64_t pos;                               /* sample frame within the current wave buffer */
     int started_wb;                            /* the current one's start was set up */
@@ -235,6 +235,7 @@ static void release_wb(Voice *v, uint64_t wb) {
     if (v->nrel == MAX_REL) {
         memmove(v->rel, v->rel + 1, (size_t)(MAX_REL - 1) * sizeof v->rel[0]);
         v->nrel--;
+        if (v->nrel_seen) v->nrel_seen--;
     }
     v->rel[v->nrel++] = wb;
 }
@@ -878,6 +879,11 @@ static void output_frame(const int16_t *pcm) {
    its VoiceType for the next sound right after releasing it, so its handle names the new voice by the time the
    update comes (looked up then, a queued release ended the new sound: no footsteps or hits). A released slot stays
    taken until the update applies the release, so the indices hold for the queue's life.
+   The other way too: the wave buffers the mixer finishes reach the game at the next update (GetReleasedWaveBuffer
+   returns them, GetWaveBufferCount stops counting them), as the console's renderer reports them. Seen as the mixer
+   finished them, a pass over the voices could find the first ones full and a later one a buffer short: Ocarina's sound
+   thread feeds its six speaker voices that way, appended the short one an extra buffer, then one more each pass, until
+   the queue was full and that speaker went silent for good (a run in five or so).
    HOS_AUDIO_IMMEDIATE=1: every change applied as it comes (as before). */
 enum { OP_VOICE_RELEASE, OP_VOICE_DEST, OP_VOICE_MIX_VOLUME, OP_VOICE_VOLUME, OP_VOICE_PITCH, OP_VOICE_BIQUAD,
        OP_VOICE_STATE, OP_VOICE_APPEND, OP_MIX_RELEASE, OP_MIX_VOLUME, OP_MIX_DEST, OP_MIX_MIX_VOLUME, OP_SPLIT_RELEASE,
@@ -983,6 +989,7 @@ static void submit(const Cmd *k) {   /* (with the lock held) */
 static void commit(void) {   /* (with the lock held) */
     for (int i = 0; i < ncmds; i++) apply(&cmds[i]);
     ncmds = 0;
+    for (int i = 0; i < MAX_VOICES; i++) voices[i].nrel_seen = voices[i].nrel;   /* (the finished buffers, to the game) */
 }
 
 /* The mixer's next deadline. `next` was the one just woken for; one frame is `period` later, on that same grid.
@@ -1458,10 +1465,11 @@ HLE(_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
     uint64_t r = 0;
-    if (v && v->nrel) {
+    if (v && v->nrel_seen) {   /* (those released by the last update: see "parameter updates") */
         r = v->rel[0];
         memmove(v->rel, v->rel + 1, (size_t)(v->nrel - 1) * sizeof v->rel[0]);
         v->nrel--;
+        v->nrel_seen--;
     }
     au_unlock();
     RET(r);
@@ -1469,7 +1477,7 @@ HLE(_ZN2nn5audio21GetReleasedWaveBufferEPNS0_9VoiceTypeE) {
 HLE(_ZN2nn5audio18GetWaveBufferCountEPKNS0_9VoiceTypeE) {
     au_lock();
     Voice *v = voice_of(ARG(0));
-    RET(v ? v->nwb + v->pending_wb : 0);
+    RET(v ? v->nwb + v->pending_wb + (v->nrel - v->nrel_seen) : 0);   /* (finished since the last update: still queued) */
     au_unlock();
 }
 HLE(_ZN2nn5audio25GetVoicePlayedSampleCountEPKNS0_9VoiceTypeE) {

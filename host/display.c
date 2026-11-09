@@ -17,6 +17,9 @@
 #include "../gpu/render/rx.h"
 void rx_close_asked(void);   /* host/rx_backend.c */
 #include "../gpu/vk/vk_api.h"
+
+void hos_relaunch_ask(void);        /* (host/hos_relaunch.c) */
+void hos_window_closed_exit(void);
 #ifndef WM_DPICHANGED
 #define WM_DPICHANGED 0x02E0
 #endif
@@ -243,11 +246,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     case WM_ERASEBKGND:
         return renderer ? 1 : DefWindowProcA(w, msg, wp, lp);
+    case WM_APP + 9:   /* (the Insert menu's Restart now: closed as by the player, then started again: host/hos_relaunch.c) */
+        hos_relaunch_ask();
+        /* fall through */
     case WM_CLOSE:
         rx_close_asked();   /* (a start still preparing the shaders keeps what it made) */
-        hos_log("display: window closed, exiting");
-        hos_log_flush();
-        ExitProcess(0);
+        hos_window_closed_exit();
         return 0;
     }
     return DefWindowProcA(w, msg, wp, lp);

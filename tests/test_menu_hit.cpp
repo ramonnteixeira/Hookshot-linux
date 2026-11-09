@@ -176,5 +176,23 @@ int main() {
         CHECK("list, scale 2: the last line", h.part == kListLine && h.index == 19 && h.side == 0);
     }
 
+    // ---- the restart question: Later from 16, Restart now from 182, both 150 wide, 120 to 154 high ----
+    {
+        const int ah = kAskHeight;
+        h = ask(20, 130, 1, kWidth, ah);
+        CHECK("ask: Later", h.part == kButton && h.index == 0);
+        h = ask(331, 153, 1, kWidth, ah);
+        CHECK("ask: Restart now", h.part == kButton && h.index == 1);
+        CHECK("ask: between the buttons", ask(170, 130, 1, kWidth, ah).part == kNone);
+        CHECK("ask: past Restart now", ask(340, 130, 1, kWidth, ah).part == kNone);
+        CHECK("ask: above the buttons", ask(20, 119, 1, kWidth, ah).part == kNone);
+        CHECK("ask: below the buttons", ask(20, 154, 1, kWidth, ah).part == kNone);
+        CHECK("ask: off the page", ask(20, ah, 1, kWidth, ah).part == kOutside);
+        h = ask(190 * 2, 125 * 2, 2, kWidth * 2, ah * 2);
+        CHECK("ask, scale 2: Restart now", h.part == kButton && h.index == 1);
+        h = ask(17 * 2, 153 * 2 + 1, 2, kWidth * 2, ah * 2);
+        CHECK("ask, scale 2: Later", h.part == kButton && h.index == 0);
+    }
+
     std::puts("menu hit-test: all checks passed");
 }

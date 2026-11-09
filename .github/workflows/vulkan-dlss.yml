@@ -1,0 +1,115 @@
+# NVIDIA DLSS is a local build's option: NVIDIA's SDK is never part of Hookshot or its downloads. This only checks that
+# hookshot_vk.dll still compiles and links with it, through llvm-mingw as players build it. It runs by hand, and on a push or
+# pull request only when a file DLSS's build depends on changed (the paths below), not on every push. scripts/ngx_sdk.py
+# fetches the SDK at its pinned release, SHA-256 checked, without DLSS's runtime: NVIDIA's license is accepted for that run
+# alone (--accept-nvidia-license), and nothing of it is uploaded or cached.
+name: Vulkan back end with NVIDIA DLSS
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'gpu/vk/vk_dlss*'
+      - 'gpu/vk/vk_reflex*'
+      - 'gpu/vk/vk_ngx_msvc_rt.cpp'
+      - 'gpu/vk/upscaler_rows.h'
+      - 'gpu/vk/dlss_math.h'
+      - 'gpu/vk/shaders/dlss_*'
+      - 'host/mingw_msvc_shims.c'
+      - 'nx2/oot_jitter.py'
+      - 'nx2/build.py'
+      - 'nx2/make_game.py'
+      - 'scripts/ngx_sdk.py'
+      - '.github/workflows/vulkan-dlss.yml'
+  pull_request:
+    paths:
+      - 'gpu/vk/vk_dlss*'
+      - 'gpu/vk/vk_reflex*'
+      - 'gpu/vk/vk_ngx_msvc_rt.cpp'
+      - 'gpu/vk/upscaler_rows.h'
+      - 'gpu/vk/dlss_math.h'
+      - 'gpu/vk/shaders/dlss_*'
+      - 'host/mingw_msvc_shims.c'
+      - 'nx2/oot_jitter.py'
+      - 'nx2/build.py'
+      - 'nx2/make_game.py'
+      - 'scripts/ngx_sdk.py'
+      - '.github/workflows/vulkan-dlss.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vulkan-dlss:
+    name: Windows Vulkan back end with NVIDIA DLSS (llvm-mingw, link check)
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out pinned Vulkan headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 74d8a6cb930c68ef617b202c3ff3c59d919e086b # v1.4.345
+          path: _deps/cpm/vulkanheaders/v1.4.345
+          persist-credentials: false
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 04f10f650d514df88b76d25e83db360142c7b174 # vulkan-sdk-1.4.341.0
+          path: _deps/cpm/spirv-headers/vulkan-sdk-1.4.341.0
+          persist-credentials: false
+      - name: Check out pinned VulkanMemoryAllocator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+          ref: 1d8f600fd424278486eade7ed3e877c99f0846b1 # v3.3.0
+          path: _deps/cpm/vulkanmemoryallocator/v3.3.0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: llvm-mingw version
+        id: llvm
+        run: echo "name=$(python -I scripts/release_parts.py llvm-mingw --name)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm
+          key: ${{ steps.llvm.outputs.name }}
+      - name: llvm-mingw
+        run: echo "HOOKSHOT_MINGW=$(python -I scripts/release_parts.py llvm-mingw "$RUNNER_TEMP/llvm")" >> "$GITHUB_ENV"
+      - name: NVIDIA's DLSS SDK (headers and nvsdk_ngx_s.lib)
+        run: python -I scripts/ngx_sdk.py --platform windows --build-only --accept-nvidia-license "$RUNNER_TEMP/ngx-sdk"
+      - name: hookshot_vk.dll with NVIDIA DLSS
+        env:
+          RX_VK_ONLY: '1'
+          RX_RELEASE: '1'
+        run: |
+          OOT_WORK="$RUNNER_TEMP/vk-work" RX_CPM="$GITHUB_WORKSPACE/_deps/cpm" HOOKSHOT_NGX_SDK="$RUNNER_TEMP/ngx-sdk" \
+            python -I nx2/build.py --standalone --jobs "$NUMBER_OF_PROCESSORS" | tee "$RUNNER_TEMP/vk-build.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          grep -q "with NVIDIA DLSS" "$RUNNER_TEMP/vk-build.log"
+      # (what it loads is only Windows' own: the system DLLs and the UCRT's api-ms-win-crt-*. NVIDIA's runtime, nvngx_dlss.dll,
+      # is loaded by NGX at run time from the game folder's ngx folder, and its core, _nvngx.dll, from the driver's)
+      - name: Imports
+        run: |
+          dll="$RUNNER_TEMP/vk-work/sa/build/hookshot_vk.dll"
+          "$HOOKSHOT_MINGW/bin/llvm-objdump" -p "$dll" | sed -n 's/^ *DLL Name: //p' | tr -d '\r' | sort -u | tee "$RUNNER_TEMP/imports.txt"
+          if grep -viE '^(kernel32|user32|gdi32|advapi32)\.dll$|^api-ms-win-crt-[a-z0-9-]+\.dll$' "$RUNNER_TEMP/imports.txt"; then
+            echo "::error::hookshot_vk.dll with NVIDIA DLSS imports a DLL that is not Windows' own (above)"
+            exit 1
+          fi

@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "../gpu/vk/vk_api.h"
+#include "../gpu/vk/dlss_math.h"
 
 /* the WebGPU renderer (gpu/render, renamed) */
 int wgr_start(void *hwnd);
@@ -300,7 +301,34 @@ void rx_wait_writebacks_reading(const void *p, uint64_t n) {
     vk ? vk->wait_writebacks_reading(p, n) : wgr_wait_writebacks_reading(p, n);
 }
 void rx_nvn_finish(void) { vk ? vk->nvn_finish() : wgr_nvn_finish(); }
-void rx_nvn_present(const nvn_tex *t, const int crop[4]) { vk ? vk->nvn_present(t, crop) : wgr_nvn_present(t, crop); }
+static volatile LONG presents;   /* (the frames shown, for the camera jitter below) */
+void rx_nvn_present(const nvn_tex *t, const int crop[4]) {
+    InterlockedIncrement(&presents);
+    vk ? vk->nvn_present(t, crop) : wgr_nvn_present(t, crop);
+}
+/* (hookshot, nx2/oot_jitter.py) NVIDIA DLSS's camera jitter: this frame's sub-pixel offset of the scene's projection, in clip
+   space (what P[0][2] and P[1][2] get), into out, for the projection matrix at guest address projection (row major, as the
+   game fills its views' uniform buffers from it); 0 when there is none: DLSS off (or a renderer without it: rx_option
+   HOS_OPT_DLSS_JITTER_W and _H, the scene's size in pixels, are 0), or a projection that is not one of the picture's
+   (gpu/vk/dlss_math.h dlss_jitter_clip: a shadow map's, the HUD's). The renderer reads the offset back from
+   the camera's uniform buffer (gpu/vk/vk_dlss.cpp), so this only has to pick sub-pixel offsets that cover a pixel evenly:
+   the Halton (2, 3) sequence, over as many frames as DLSS's scale wants (HOS_OPT_DLSS_JITTER_PHASES: gpu/vk/dlss_math.h
+   dlss_jitter_phases, 8 for DLAA up to 64). */
+int hos_dlss_jitter_clip(uint64_t projection, float out[2]) {
+    static LONG at = -1;
+    static float w, h;
+    static int phases;
+    const LONG frame = presents;
+    if (frame != at) {   /* (asked once a frame: the renderer's lock is not taken for every view) */
+        at = frame;
+        w = (float)rx_option(HOS_OPT_DLSS_JITTER_W, 0), h = (float)rx_option(HOS_OPT_DLSS_JITTER_H, 0);
+        phases = rx_option(HOS_OPT_DLSS_JITTER_PHASES, 16);
+    }
+    float p[16];
+    memcpy(p, GP(projection), sizeof p);
+    extern volatile float hos_wide_ratio;
+    return dlss_jitter_clip(p, hos_wide_ratio, (unsigned)frame, phases, w, h, out);
+}
 static void forward(const early_call *c) {
     switch (c->kind) {
     case 0: {

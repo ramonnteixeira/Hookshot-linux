@@ -20,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "hos_sdl.h"
+#include "hd_rumble.h"
 #include "hos_motion.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_PAD_*) */
 
@@ -39,6 +40,9 @@ static struct {
     int32_t id;
     uint16_t rumble_lo, rumble_hi;
     int64_t rumble_ns;
+    uint8_t hd, hd_kind, hd_ever;   /* HD rumble (hd_rumble.h): HD_RUMBLE_UNKNOWN / ON / OFF, the pad's kind, sent once */
+    uint8_t hd_sent[HD_RUMBLE_PACKET_SIZE];
+    int64_t hd_ns;
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
     uint64_t input_sig;
@@ -52,6 +56,10 @@ static uint64_t state_buttons;
 static int32_t state_stick[4];
 static int state_count;
 static volatile LONG rumble_low, rumble_high;   /* 0..65535, set by the vibration HLE */
+/* the game's own vibration values per side (0 left, 1 right: {amp_low, freq_low, amp_high, freq_high}), for the pads
+   that play HD rumble; silence until the game sends one */
+static SRWLOCK hd_lock = SRWLOCK_INIT;
+static float hd_values[2][4] = {{0.0f, 160.0f, 0.0f, 320.0f}, {0.0f, 160.0f, 0.0f, 320.0f}};
 /* (motion) the pad read and its filter (the polling thread's own), then what the game is handed (under state_lock): the
    last HOS_MOTION_HISTORY readings, newest at motion_hist[motion_head]; gyro_status for the menu */
 static HosMotion motion;
@@ -116,6 +124,49 @@ static void rumble_strength(unsigned heavy, unsigned light, int percent, uint16_
     }
     out[0] = (uint16_t)h;
     out[1] = (uint16_t)l;
+}
+
+/* A pad SDL just opened: HD rumble when it is a Switch Pro Controller or a Joy-Con and the SDL has the effect call
+   (HOS_HD_RUMBLE=0: never); whether SDL's driver takes it shows with the first packet. */
+static void hd_open(int i, void *gc) {
+    static int env_off = -1;
+    if (env_off < 0) {
+        const char *e = getenv("HOS_HD_RUMBLE");
+        env_off = e && !strcmp(e, "0");
+    }
+    pads[i].hd_kind = (uint8_t)hd_rumble_kind(hos_sdl_load(), hos_sdl_pad_type(gc));
+    pads[i].hd = (uint8_t)hd_rumble_start(pads[i].hd_kind, hos_sdl_pad_has_effect(), env_off);
+    pads[i].hd_ever = 0;
+    pads[i].hd_ns = 0;
+    const uint8_t n[4] = {0x00, 0x01, 0x40, 0x40};
+    hd_rumble_packet(HD_RUMBLE_PRO, n, n, pads[i].hd_sent);
+}
+
+/* A pad's HD rumble, each poll: its packet when due (hd_rumble_due). 1 when the pad plays HD rumble (the motor rumble
+   is not sent to it); 0 when it does not, or SDL just refused it (then it gets the motor rumble from now on). side:
+   the left side's bytes, the right's, and both merged (for a single Joy-Con, which has only one). */
+static int hd_poll(int i, const uint8_t side[3][4], long long now) {
+    if (pads[i].hd == HD_RUMBLE_OFF) return 0;
+    uint8_t packet[HD_RUMBLE_PACKET_SIZE];
+    const int single = pads[i].hd_kind == HD_RUMBLE_JOYCON_LEFT || pads[i].hd_kind == HD_RUMBLE_JOYCON_RIGHT;
+    hd_rumble_packet(pads[i].hd_kind, single ? side[2] : side[0], single ? side[2] : side[1], packet);
+    if (!hd_rumble_due(packet, pads[i].hd_sent, pads[i].hd_ever, now, pads[i].hd_ns)) return 1;
+    const int was = pads[i].hd;
+    pads[i].hd = (uint8_t)hd_rumble_after_send(hos_sdl_pad_effect(pads[i].gc, packet, sizeof packet));
+    if (pads[i].hd == HD_RUMBLE_OFF) {   /* (refused: HD rumble off for this pad until it is closed and opened again.
+                                           SDL3 queues the write, so false means the driver does not support the effect,
+                                           not a write that failed once) */
+        hos_log("hid: \"%s\" did not take HD rumble (%s): its rumble goes to its motors", hos_sdl_pad_name(pads[i].gc),
+                hos_sdl_error());
+        pads[i].rumble_lo = pads[i].rumble_hi = 0;   /* (the motor path sends what is playing at once) */
+        pads[i].rumble_ns = 0;
+        return 0;
+    }
+    if (was == HD_RUMBLE_UNKNOWN) hos_log("hid: HD rumble on \"%s\"", hos_sdl_pad_name(pads[i].gc));
+    memcpy(pads[i].hd_sent, packet, sizeof packet);
+    pads[i].hd_ns = now;
+    pads[i].hd_ever = 1;
+    return 1;
 }
 
 /* (motion) the sensors on while Motion controls is on (HOS_OPT_GYRO, on without the menu), off otherwise; the pad with
@@ -235,6 +286,7 @@ static void pads_poll(void) {
                 pads[slot].id = hos_sdl_pad_id(gc);
                 pads[slot].rumble_lo = pads[slot].rumble_hi = 0;
                 pads[slot].rumble_ns = 0;
+                hd_open(slot, gc);
                 pads[slot].motion = hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_GYRO) && hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_ACCEL);
                 pads[slot].motion_on = 0;
                 pads[slot].motion_retry_ns = 0;
@@ -249,10 +301,23 @@ static void pads_poll(void) {
         int32_t s[4] = {0};
         int count = 0;
         int rx_option(int id, int otherwise);
-        const int strength = rx_option(9, 100);   /* (the menu's Rumble strength) */
+        const int strength = rx_option(9, 100);   /* (the menu's Rumble strength: the motors' and HD rumble's) */
         uint16_t motors[2];
         rumble_strength((uint16_t)rumble_low, (uint16_t)rumble_high, strength, motors);
         const uint16_t lo = motors[0], hi = motors[1];
+        uint8_t side[3][4];   /* (the HD rumble pads': each side's bytes, then both merged for a single Joy-Con) */
+        {
+            float hv[2][4], felt[3][4];
+            AcquireSRWLockShared(&hd_lock);
+            memcpy(hv, hd_values, sizeof hv);
+            ReleaseSRWLockShared(&hd_lock);
+            hd_rumble_felt(hv[0], felt[0]);   /* (the game's small amplitudes, as the motors get them) */
+            hd_rumble_felt(hv[1], felt[1]);
+            hd_rumble_encode(felt[0], strength, side[0]);
+            hd_rumble_encode(felt[1], strength, side[1]);
+            hd_rumble_merge(felt[0], felt[1], felt[2]);
+            hd_rumble_encode(felt[2], strength, side[2]);
+        }
         for (int i = 0; i < MAX_PADS; i++) {
             void *gc = pads[i].gc;
             if (!gc) continue;
@@ -274,6 +339,7 @@ static void pads_poll(void) {
                 for (int k = 0; k < 4; k++) sig |= (uint64_t)(v[k] > 0 ? 1 : v[k] < 0 ? 2 : 0) << (32 + 2 * k);
                 if (sig != pads[i].input_sig) pads[i].input_sig = sig, pads[i].used_ns = now;
             }
+            if (hd_poll(i, side, now)) continue;
             if (rumble_due(lo, hi, pads[i].rumble_lo, pads[i].rumble_hi, now, pads[i].rumble_ns)) {
                 hos_sdl_pad_rumble(gc, lo, hi, lo || hi ? 1000 : 0);
                 pads[i].rumble_lo = lo;
@@ -360,4 +426,12 @@ void hos_sdl_rumble(float low, float high) {
     if (high > 1) high = 1;
     InterlockedExchange(&rumble_low, (LONG)(low * 65535));
     InterlockedExchange(&rumble_high, (LONG)(high * 65535));
+}
+
+/* The game's own vibration value for one side (0 left, 1 right; {amp_low, freq_low, amp_high, freq_high}), for the
+   pads that play HD rumble (hd_rumble.h); nn_hid.c's vibration_send, beside hos_sdl_rumble. */
+void hos_sdl_rumble_hd(int side, const float value[4]) {
+    AcquireSRWLockExclusive(&hd_lock);
+    memcpy(hd_values[side & 1], value, sizeof hd_values[0]);
+    ReleaseSRWLockExclusive(&hd_lock);
 }

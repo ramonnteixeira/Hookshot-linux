@@ -2,13 +2,14 @@
 
 The game draws a 2560x1440 picture whatever the screen and renders its scene at 1920x1080; its cameras use a 16:9 ratio.
 With these patches the picture takes the window's shape (the height stays the game's, the width grows: Hor+), the 16:9
-cameras take the picture's ratio, the HUD and menus keep their 16:9 shape in the middle of the picture, and pre-rendered
-movies play in that middle 16:9. Every patch reads host globals (host/hos_wide.c) that stay 0 for a 16:9 window, so the
-game runs as shipped then.
+cameras take the picture's ratio, the HUD and menus keep their 16:9 shape in the middle of the picture, pre-rendered
+movies play in that middle 16:9, and the picture a save keeps shows that middle 16:9. Every patch reads host globals
+(host/hos_wide.c) that stay 0 for a 16:9 window, so the game runs as shipped then.
 
 The sites and what each does come from NX2navi's recomp/patches-v111.txt, where they are credited to Ivan0xFF (MIT,
 "The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF"); the picture and scene size sites are the same
-constants that file names. Here each is written as C after the original instruction instead of a replacement of it.
+constants that file names; the save picture's site is Hookshot's own (issue 952). Here each is written as C after the
+original instruction instead of a replacement of it.
 Each site's original instruction word is checked: another game version leaves the site out (and says so).
 """
 
@@ -47,6 +48,14 @@ MOVIE = ("{ extern volatile float hos_wide_margin; const float _m = hos_wide_mar
          "memcpy(&_ua, &_a, 4); memcpy(&_ub, &_b, 4); recomp_store32(c, _vp + 8, _ua); recomp_store32(c, _vp + 16, _ub); } }"
          "   /* (nx2/oot_wide.py: movies in the middle 16:9) */")
 
+# The save's picture (issue 952): the pause menu draws the whole picture into a 543 x 306 texture, the save's JPEG, through the
+# game's viewport-and-scissor helper (f_802a46e0: SetScissor, then SetViewport(x, y, w, h) in w1-w4 from [x8], called by blr x8).
+# Wider than 16:9, the whole picture was squeezed into it. That one viewport is made wider than the texture by the picture's
+# ratio over 16:9, centred: the middle 16:9 fills the texture (the scissor keeps the texture's), as a 16:9 window would show.
+THUMB = ("{ extern volatile float hos_wide_squeeze; const float _q = hos_wide_squeeze; if (_q > 0.0f && (uint32_t)c->x[1] == 0 "
+         "&& (uint32_t)c->x[2] == 0 && (uint32_t)c->x[3] == 543 && (uint32_t)c->x[4] == 306) { const int _w = (int)(543.0f / _q + 0.5f); "
+         "c->x[1] = (uint32_t)((543 - _w) / 2); c->x[3] = (uint32_t)_w; } }   /* (nx2/oot_wide.py: the save's picture, the middle 16:9) */")
+
 # (main offset, the original instruction word there, the C after it)
 SITES = (
     # the picture: the graphics setup and the display settings object build {2560, 1440} in x8 (mov, then this movk)
@@ -65,6 +74,8 @@ SITES = (
     (0x774368, 0xad401041, HUD),
     # the movie layer's draw: its viewport (min x at x29 - 32, max x at x29 - 24) after ldp x9, x8, [x19, #0x18]
     (0x3b5c758, 0xa941a269, MOVIE),
+    # the viewport helper's SetViewport, after the call's address is loaded (ldr x8, [x8]), before blr x8
+    (0x284824, 0xf9400108, THUMB),
 )
 
 

@@ -36,6 +36,10 @@ static class Storage
 
     public static bool WorkChosen => !Same(Work, Base);
 
+    /// (NVIDIA DLSS, only when ticked) NVIDIA's DLSS SDK, downloaded under NVIDIA's license by the build (make_game.py
+    /// --fetch-ngx-sdk, scripts/ngx_sdk.py): HOOKSHOT_NGX_SDK. NVIDIA's files, never part of the builder or its downloads
+    public static string NgxSdk => Path.Combine(Base, "ngx-sdk");
+
     /// The build files go to a folder of their own in the one the player picked (null: back to the builder's own). What the last
     /// builds left at the old place goes: the next build would not look for it there
     public static void MoveWork(string? picked)

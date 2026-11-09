@@ -418,7 +418,8 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     static bool reported = false;
     if (report && !reported) {
         reported = true;
-        logf("vk: upscale dispatched: mode %d, sharpness %d, source %ux%u, crop request %d,%d %dx%d, destination %ux%u",
+        logf("vk: upscale dispatched: mode %d, sharpness %d%% (of RCAS's strongest, neighbours one source pixel apart), source %ux%u, "
+             "crop request %d,%d %dx%d, destination %ux%u",
              opts.upscale, opts.sharpness, sw, sh, crop ? crop[0] : 0, crop ? crop[1] : 0,
              crop ? crop[2] : (int)sw, crop ? crop[3] : (int)sh, dw, dh);
     }

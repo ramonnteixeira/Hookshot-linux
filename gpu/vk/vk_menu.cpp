@@ -9,6 +9,10 @@
 // half changes it down or up, on a toggle flips it, on a slider's track sets it (or drag it); the wheel changes the value
 // under the cursor, else moves the selection; a right click is Esc. On the Cheats page and its lists a click is Enter (on a
 // choice's or an amount's left or right half, Left or Right) and a right click goes back. vk_menu_hit.h has the layout.
+// (hookshot) The rows that take a restart (Row::restart) say "(after restart)" while their value is not the one the game
+// started with, and the Graphics tab lists them. Closing the menu then asks whether to restart now (menu_restart.h):
+// Later keeps the saved settings for the next start and is not asked again until they change; Restart now saves and
+// closes the window as the player would, and the game starts again (WM_APP + 9: host/hos_relaunch.c).
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -22,9 +26,14 @@
 #include "vk_paths.h"
 #include "vk_menu.h"
 #include "vk_menu_hit.h"
+#include "vk_draw.h"   // (pipeline_cache_save: Restart now keeps what was built)
 #include "oot_cheat_items.h"
 #include "vk_startup_paint.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
+#include "vk_dlss.h"
+#include "vk_reflex.h"
+#include "upscaler_rows.h"
+#include "menu_restart.h"
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
 #endif
@@ -49,9 +58,23 @@ struct Row {
     int* value;
     int lo, hi, step;
     const char* (*text)(int v);
-    const char* help;   // (shown under the list while the row is selected)
+    const char* help;   // (shown under the list while the row is selected: what the row is, the same whatever its value)
+    // (a line about the value chosen, under the help, or nullptr: hint(v, -1) is the one to show now for v, hint(v, 0),
+    // hint(v, 1), ... every one v can have (those that depend on the other rows or on the GPU), until nullptr, so the
+    // menu keeps the height of the tallest: measure_help)
+    const char* (*hint)(int v, int variant) = nullptr;
+    bool restart = false;   // (read once, at the start: a change applies after a restart)
     bool preset_exempt = false;   // (a change here leaves the Quality preset alone: the controls, the window, the counter)
 };
+/// A row's hints from a table, the value lo first (nullptr: none for that value)
+const char* hint_in(const char* const* t, int n, int lo, int v, int variant) {
+    return variant <= 0 && v - lo >= 0 && v - lo < n ? t[v - lo] : nullptr;
+}
+#define MENU_HINTS(fn, lo, ...)                                                                                              \
+    const char* fn(int v, int variant) {                                                                                     \
+        static const char* const t[] = {__VA_ARGS__};                                                                        \
+        return hint_in(t, (int)(sizeof t / sizeof t[0]), lo, v, variant);                                                    \
+    }
 const char* tx_framegen(int v) {
     static const char* t[] = {"Off", "", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
     return t[v];
@@ -72,10 +95,100 @@ const char* tx_sens(int v) {
     snprintf(b, sizeof b, "%.2f", v / 100.0);
     return b;
 }
+// (the game's picture and the window it is shown in, as the last present had them: menu_note_present_sizes)
+std::atomic<uint64_t> present_sizes{0};
+bool filter_needed() {
+    const uint64_t v = present_sizes.load(std::memory_order_relaxed);
+    return upscaler_rows::filter_needed((unsigned)(v >> 48), (unsigned)(v >> 32) & 0xffff, (unsigned)(v >> 16) & 0xffff,
+                                        (unsigned)v & 0xffff);
+}
 const char* tx_upscale(int v) {
     static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
     return t[v];
+}
+/// The Window scaling filter row's value: its filter, or that none is needed (the saved value stays, for another window size)
+const char* tx_filter(int v) { return filter_needed() ? tx_upscale(v) : "Not needed (window = output)"; }
+const char* tx_reflex(int v) {
+    static const char* t[] = {"Off", "On", "On + Boost"};
+    return t[reflex_available() ? std::clamp(v, 0, 2) : 0];
+}
+/// Reflex: on the value, or that it is not available here (the row shows Off)
+const char* hn_reflex(int v, int variant) {
+    static const char* const t[] = {"The game as without it.", "The driver paces the frames for less latency.",
+                                    "As On, and the GPU's clocks are kept up as well."};
+    static const char* const none = "Not available here: it needs an NVIDIA GPU whose driver has VK_NV_low_latency2.";
+    if (variant < 0) return reflex_available() ? t[std::clamp(v, 0, 2)] : none;
+    return variant == 0 ? t[std::clamp(v, 0, 2)] : variant == 1 ? none : nullptr;
+}
+// The Upscaler (opts.dlss): what scales the 3D up to the output. DLSS and DLAA only where dlss_why() lets them run; the menu
+// shows (and steps from) what runs, dlss_mode(), and keeps the saved choice for a PC where it can
+namespace ur = upscaler_rows;
+int upscaler() { return dlss_mode(); }
+const char* tx_upscaler(int) {
+    static const char* t[] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA"};
+    return t[std::clamp(upscaler(), 0, 2)];
+}
+/// The Upscaler: the one shown (what runs, upscaler()), and with the game's own, why DLSS and DLAA are not offered
+const char* hn_upscaler(int v, int variant) {
+    static const char* const t[] = {
+        "The game's own network.",
+        "NVIDIA's, from a smaller 3D. Softer than the game's own: set Sharpness to around 80%. Things that move by "
+        "themselves can trail for now.",
+        "NVIDIA's, the 3D at full size with its edges smoothed; the slowest. Softer than the game's own: set Sharpness to "
+        "around 80%. Things that move by themselves can trail for now.",
+    };
+    static const char* const why[DLSS_WHY_COUNT] = {
+        nullptr,
+        "DLSS and DLAA: not in this build (built without NVIDIA's DLSS SDK, see the readme).",
+        "DLSS and DLAA: off for this run (RX_VK_DLSS=0).",
+        "DLSS and DLAA: need an NVIDIA RTX GPU.",
+        "DLSS and DLAA: need a newer NVIDIA driver.",
+        "DLSS and DLAA: DLSS's runtime was not found (the game folder's ngx folder, see the readme).",
+    };
+    // (now: the value shown and what runs here; every one: each value, and the game's own with each reason)
+    int w = 0;
+    if (variant < 0) v = std::clamp(upscaler(), 0, 2), w = (int)dlss_why();
+    else if (v == ur::GAME) w = variant;
+    else if (variant > 0) return nullptr;
+    v = std::clamp(v, 0, 2);
+    if (w >= DLSS_WHY_COUNT) return nullptr;
+    if (v != ur::GAME || !why[w]) return t[v];
+    static char b[DLSS_WHY_COUNT][256];
+    snprintf(b[w], sizeof b[w], "%s %s", t[0], why[w]);
+    return b[w];
+}
+/// The DLSS model row (opts.dlss_model): NVIDIA's network by its preset, or RX_VK_DLSS_PRESET's for this run
+const char* dlss_preset_env() {
+    static const char* const e = getenv("RX_VK_DLSS_PRESET");
+    return ur::preset_env(e) ? e : nullptr;
+}
+const char* tx_dlss_model(int v) {
+    static const char* const t[] = {"Transformer (K)", "Transformer 2 (M)", "Transformer 2 (L)", "NVIDIA default"};
+    if (const char* e = dlss_preset_env()) {
+        static char b[48];
+        const unsigned p = ur::dlss_preset(v, e);
+        if (p) snprintf(b, sizeof b, "Preset %c (RX_VK_DLSS_PRESET)", ur::preset_letter(p));
+        else snprintf(b, sizeof b, "NVIDIA default (RX_VK_DLSS_PRESET)");
+        return b;
+    }
+    return t[std::clamp(v, 0, ur::kModels - 1)];
+}
+/// The DLSS model: the value chosen; variant 1: the game's own upscales (the row waits for DLSS or DLAA); variant 2: set for
+/// this run by RX_VK_DLSS_PRESET
+const char* hn_dlss_model(int v, int variant) {
+    static const char* const t[] = {
+        "NVIDIA's transformer model: the one tested most here.",
+        "NVIDIA's second-generation transformer, its pick for Performance: sharper, at a little more GPU time.",
+        "The second-generation transformer as NVIDIA tuned it for Ultra Performance, the smallest Render resolutions.",
+        "Lets DLSS's runtime pick for each mode: what it picks can change with a runtime update.",
+    };
+    static const char* const unused = "Used by NVIDIA DLSS and DLAA: choose one in the Upscaler row.";
+    static const char* const env = "Set for this run by RX_VK_DLSS_PRESET.";
+    if (variant < 0) variant = dlss_preset_env() ? 2 : upscaler() == ur::GAME ? 1 : 0;
+    if (variant == 1) return unused;
+    if (variant == 2) return env;
+    return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
 const char* tx_percent(int v) {
     static char b[8];
@@ -101,7 +214,6 @@ int step_output_choice(int id, int dir) {
 Out shown_output() {
     return opts.handheld ? Out{1536, 864} : kOutputs[output_choice(opts.output_res)];
 }
-constexpr int kResPercent[] = {0, 100, 75, 67, 50};
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
 // outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
 // 3840x2160, not the 2560x1440 of 8/12.
@@ -113,17 +225,51 @@ void game_size(float scale, uint32_t& w, uint32_t& h) {
 }
 const char* tx_resolution(int v) {
     static char b[48];
-    if (v <= 0 || v > 4) return "Auto (dynamic)";
+    const int up = upscaler();
+    if (up == ur::DLAA) return "Native (DLAA)";
+    if (!ur::percent(v)) return "Auto (dynamic)";
+    if (const char* mode = up == ur::DLSS ? ur::dlss_mode_name(v) : nullptr) {
+        snprintf(b, sizeof b, "%s (%d%%)", mode, ur::percent(v));
+        return b;
+    }
     uint32_t w, h;
-    game_size(kResPercent[v] / 100.0f, w, h);
-    snprintf(b, sizeof b, "%d%% (%ux%u)", kResPercent[v], w, h);
+    game_size(ur::percent(v) / 100.0f, w, h);
+    snprintf(b, sizeof b, "%d%% (%ux%u)", ur::percent(v), w, h);
     return b;
 }
+/// The Render resolution: the value chosen, for the Upscaler shown (every one: each value with each Upscaler)
+const char* hn_resolution(int v, int variant) {
+    const int up = variant < 0 ? std::clamp(upscaler(), 0, 2) : variant;
+    if (up > 2) return nullptr;
+    if (up == ur::DLAA)
+        return "DLAA draws the 3D at full size: nothing to set here. Choose DLSS or the game's own upscaler to draw it "
+               "smaller.";
+    const int p = ur::percent(v);
+    if (up == ur::DLSS) {
+        switch (p) {
+        case 0: return "The game lowers it when the GPU is busy, and DLSS follows. Set Sharpness to around 80%.";
+        case 67: return "DLSS's sharpest mode. Set Sharpness to around 80%.";
+        case 58: return "Between Quality and Performance. Set Sharpness to around 80%.";
+        case 50: return "Faster, and softer. Set Sharpness to around 80%.";
+        case 33: return "DLSS's fastest mode, and its softest. Set Sharpness to around 80%.";
+        default: return nullptr;   // (not one of DLSS's steps: the row moves to one)
+        }
+    }
+    if (!p) return "The game lowers it when the GPU is busy.";
+    if (p == 100) return "The 3D at the output's full size: the sharpest, and the slowest.";
+    return "A steady size: lower is faster, and softer.";
+}
+/// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
+bool row_fixed(const int* value) {
+    return (value == &opts.reflex && !reflex_available()) || (value == &opts.dlss && ur::upscaler_fixed(dlss_why() == DLSS_OK)) ||
+           (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
+           (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr));
+}
 const char* tx_output_res(int v) {
-    static char b[48];
+    static char b[32];
     v = output_choice(v);
     const Out o = kOutputs[v];
-    snprintf(b, sizeof b, "%ux%u (%srestart)", o.w, o.h, v ? "" : "game, ");
+    snprintf(b, sizeof b, "%ux%u%s", o.w, o.h, v ? "" : " (game's)");
     return b;
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
@@ -132,18 +278,14 @@ const char* tx_text_speed(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
-const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
-const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9 (restart)"; }
-int gpu_device_at_start = 0;   // (the row's value the game started with: menu_set_gpu_count)
+const char* tx_ultrawide(int v) { return v ? "Monitor's shape" : "16:9"; }
 const char* tx_gpu(int v) {
     static char buf[300];
     const int idx = v - 1;
     if (v <= 0) snprintf(buf, sizeof buf, "Auto");
     else if (idx < (int)gpu_device_names.size()) snprintf(buf, sizeof buf, "%d: %s", idx, gpu_device_names[idx].c_str());
     else snprintf(buf, sizeof buf, "%d: Device %d", idx, idx);
-    // (a GPU other than the one in use: it takes a restart, said where the choice is, as Handheld and Ultrawide say it.
-    // The whole name shows: the selected row slides through it, see marquee_pos)
-    if (v != gpu_device_at_start) strncat(buf, " (restart)", sizeof buf - strlen(buf) - 1);
+    // (the whole name shows: the selected row slides through it, see marquee_pos)
     return buf;
 }
 const char* tx_pad_layout(int v);
@@ -178,9 +320,20 @@ const char* tx_mic(int v) {
     snprintf(buf, sizeof buf, "%s", n && *n ? n : "Microphone");
     return buf;
 }
+/// The Microphone row: Off, the default, a microphone of the list, or the chosen one while it is unplugged (variant 1)
+const char* hn_mic(int v, int variant) {
+    if (v <= 0) return variant <= 0 ? "The game hears silence." : nullptr;
+    if (v == 1)
+        return variant <= 0 ? "The system's default recording device. On Windows, desktop apps must be allowed to use the "
+                              "microphone (Settings, Privacy & security)."
+                            : nullptr;
+    const bool missing = variant < 0 ? mic_missing && v == 2 + mic_listed : variant == 1;
+    if (variant > 1) return nullptr;
+    return missing ? "Not plugged in: Default stands in until it is back." : "This microphone, by its name. A change applies at once.";
+}
 const char* tx_rumble(int v) { return v ? tx_percent(v) : "Off"; }
 const char* tx_robust(int v) {
-    static const char* t[] = {"Auto (restart)", "Off (restart)", "On (restart)"};
+    static const char* t[] = {"Auto", "Off", "On"};
     return (unsigned)v < 3 ? t[v] : t[0];
 }
 const char* tx_preset(int v) {
@@ -197,109 +350,174 @@ void sync_preset_budgets(int p) {
     default: opts.vram_mb = 0;    opts.mirror_mb = 0;    break;
     }
 }
+// (Sharpness: tuned for the window pass's neighbours one picture pixel apart, each about the old setting's sharpening on a
+// 3840 x 2160 window at that preset's picture, 2048 x 1152 or the handheld profile's 1536 x 864: same frame, mean |Laplacian|
+// of the window and of the picture, on the slider's steps)
 void apply_preset(int p) {
     switch (p) {
     case 1: // Minimum (4GB VRAM / iGPU)
-        opts.resolution = 4; opts.upscale = 2; opts.sharpness = 50;
+        opts.resolution = 4; opts.upscale = 2; opts.sharpness = 30;
         opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
         break;
     case 2: // Low (6GB VRAM)
-        opts.resolution = 2; opts.upscale = 2; opts.sharpness = 35;
+        opts.resolution = 2; opts.upscale = 2; opts.sharpness = 30;
         opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 1;
         break;
     case 3: // Balanced (8GB VRAM)
-        opts.resolution = 1; opts.upscale = 1; opts.sharpness = 25;
+        opts.resolution = 1; opts.upscale = 1; opts.sharpness = 30;
         opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
         break;
     case 4: // High (12GB VRAM)
-        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 30;
+        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 40;
         opts.framegen = 2;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
         break;
     case 5: // Ultra (16GB+ VRAM)
-        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 40;
+        opts.resolution = 1; opts.upscale = 2; opts.sharpness = 50;
         opts.framegen = 3;   opts.pace = 1;    opts.realtime = 1; opts.handheld = 0;
         break;
     default:
         break;
     }
+    // (the Upscaler is the player's: a preset never turns DLSS on or off. With DLSS its resolution is DLSS's nearest mode)
+    if (p > 0) opts.resolution = ur::snap(upscaler(), opts.resolution);
     sync_preset_budgets(p);
 }
 
+MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself comes back to Custom.",
+           "Resolution 50% (with DLSS its nearest mode), Lanczos, Sharpness 50%, 2x frames, Handheld profile.",
+           "Resolution 75% (with DLSS its nearest mode), Lanczos, Sharpness 35%, 2x frames, Handheld profile.",
+           "Resolution 100% (with DLSS its nearest mode), Catmull-Rom, Sharpness 25%, 2x frames.",
+           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 30%, 2x frames.",
+           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%, 3x frames.")
+MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
+/// Frame generation: how many frames are made for each of the game's
+const char* hn_framegen(int v, int variant) {
+    if (variant > 0 || v == 1) return nullptr;
+    if (v <= 0) return "Only the game's own frames: no added delay.";
+    static char b[9][96];
+    snprintf(b[v], sizeof b[v], "%s between each two of the game's.", v == 2 ? "One made frame" : v == 3 ? "Two made frames" : v == 4 ? "Three made frames"
+             : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
+    return b[std::clamp(v, 2, 8)];
+}
+MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
+MENU_HINTS(hn_output_res, 0, "The game's own size.",
+           "The sharpest on a 2560x1440 screen: nothing to scale to the window.",
+           "The sharpest on a 3840x2160 screen. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
+           "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.")
+/// The Window scaling filter: its filter, or that none is needed at this window's size
+const char* hn_filter(int v, int variant) {
+    static const char* const t[] = {"The plain copy.", "Sharper.", "Sharper still; can ring on edges."};
+    static const char* const none = "The window is the Output resolution's size: nothing to scale. The choice is kept for "
+                                    "another size.";
+    if (variant < 0) return filter_needed() ? t[std::clamp(v, 0, 2)] : none;
+    return variant == 0 ? t[std::clamp(v, 0, 2)] : variant == 1 ? none : nullptr;
+}
+/// Sharpness: with DLSS or DLAA, the amount that suits them
+const char* hn_sharpness(int v, int variant) {
+    static const char* const dlss = "DLSS and DLAA look softer than the game's own upscaler: around 80% suits them.";
+    const bool with_dlss = variant < 0 ? upscaler() != ur::GAME : variant == 1;
+    if (variant > 1) return nullptr;
+    return with_dlss ? dlss : v == 0 ? "Off: the picture as it is." : nullptr;
+}
+MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resolutions, lighter on the GPU.")
+MENU_HINTS(hn_ultrawide, 0, "The game's own shape.", "The camera widens to fill the screen. The HUD is still stretched.")
+MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
+MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.")
+MENU_HINTS(hn_speed, 0, "A step each frame: the game slows down whenever it runs below 60 fps.",
+           "Normal speed down to 15 fps, by taking longer steps.")
+MENU_HINTS(hn_text_speed, 0, "The game's own pace, with its pauses.", "Twice as fast.", "Four times as fast.",
+           "Each page at once, as pressing A does.")
+MENU_HINTS(hn_background, 0, "Only while the game's window has the focus.",
+           "Also behind other windows, for streaming or other apps. The keyboard and mouse still need the game's window.")
+MENU_HINTS(hn_mousecam, 0, "The mouse stands in for the right stick, with its curve and top speed.",
+           "The mouse turns the camera itself, one to one, as in a PC game.")
+MENU_HINTS(hn_mouse_invert, 0, nullptr, "Moving the mouse forward tilts the camera down.")
+MENU_HINTS(hn_gyro, 0, "The sticks alone aim.",
+           "Switch Pro controllers and pads in Switch mode, DualSense and DualShock 4. The value says whether the "
+           "connected pad has a gyroscope.")
+MENU_HINTS(hn_pad_layout, 0, "The Switch's order: A on the right, B at the bottom, X at the top, Y on the left.",
+           "A at the bottom (action and talk), B on the right, X on the left, Y at the top.",
+           "A at the bottom, B on the right; X and Y as on the Switch.",
+           "Bindings of your own, from the Controls page.")
+
 Row rows[] = {
-    // Graphics (11 rows)
+    // Graphics (the Upscaler only in a build with DLSS: row_shown)
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
-     "Automatically configures resolution, upscaling, frame generation, and dynamic VRAM limits tailored to your GPU tier."},
+     "Sets the scaling rows, frame generation and memory limits for a GPU with that much memory. The Upscaler stays yours.",
+     hn_preset},
     {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
-     "Fills the whole screen with the game, without the window's border. The same as F11.", true},
+     "Fills the whole screen with the game, without the window's border. The same as F11.", nullptr, false, true},
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
-     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart.", true},
+     "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
-     "Makes extra frames between the game's own (2x up to 8x), for smoother motion. Adds a little input delay, and fast motion or camera cuts "
-     "can show artifacts."},
-    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
-     "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
-    {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
-     "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
-     "faster."},
+     "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
+     "show artifacts.", hn_framegen},
+    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
+    {TAB_GRAPHICS, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_reflex,
+     "NVIDIA GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_reflex},
+    // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, then the window)
     {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
-     "The size the game draws its whole frame at, HUD included, before it is scaled to your window. The 3D is drawn at the "
-     "Resolution percentage of it. Docked only. Applies after a restart."},
-    {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
-     "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
+     "The game's whole frame, HUD included, before it is scaled to the window. Docked only. Applies after a restart.",
+     hn_output_res, true},
+    {TAB_GRAPHICS, "Upscaler", &opts.dlss, 0, 2, 1, tx_upscaler, "What scales the 3D up to the Output resolution.",
+     hn_upscaler},
+    {TAB_GRAPHICS, "DLSS model", &opts.dlss_model, 0, ur::kModels - 1, 1, tx_dlss_model,
+     "Which of NVIDIA's DLSS networks draws the picture.", hn_dlss_model, false, true},
+    {TAB_GRAPHICS, "Render resolution", &opts.resolution, 0, ur::kValues - 1, 1, tx_resolution,
+     "The share of the output the 3D is drawn at; the Upscaler fills in the rest.", hn_resolution},
+    {TAB_GRAPHICS, "Window scaling filter", &opts.upscale, 0, 2, 1, tx_filter,
+     "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
-     "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
-    {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
-     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
+     "Sharpens the picture as it goes to the window, with any filter. Too much shows halos around edges.", hn_sharpness},
+    {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_onoff,
+     "Runs the game as if the console were undocked. Applies after a restart.", hn_handheld, true},
     {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
-     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
+     "The camera's shape on a screen wider than 16:9. Applies after a restart.", hn_ultrawide, true},
     {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
-     "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; "
-     "Off can be faster on some NVIDIA cards. Applies after restart."},
+     "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
+     "restart.", hn_robust, true},
 
     // Gameplay (3 rows)
-    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
-     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate.", true},
-    {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed,
-     "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
-     "longer steps."},
+    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff, "Frames per second in the top right corner.", hn_fps,
+     false, true},
+    {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
+     hn_speed},
     {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
-     "How fast the letters of dialogue and other messages appear. Normal is the game's own pace, with its pauses. Instant shows "
-     "each page at once, as pressing A does."},
+     "How fast the letters of dialogue and other messages appear.", hn_text_speed},
     {TAB_GAMEPLAY, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
-     "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming). Default follows "
-     "Windows' default recording device. Windows must allow desktop apps to use the microphone.", true},
+     "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
+     true},
 
     // Controls (14 rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
-     "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
-     "apps. The keyboard and mouse still need the game's window."},
-    {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam,
-     "Native: the captured mouse turns the camera itself, one to one, as in a PC game. As the stick: the mouse stands in for "
-     "the right stick, with its curve and top speed.", true},
+     "Whether the controller plays the game while another window has the focus.", hn_background},
+    {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
+     hn_mousecam, false, true},
     {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
-     "How far the camera turns for a given mouse movement, for either Mouse camera. At 1.00 native look turns a tenth of a "
-     "degree a count. The - and = keys change it in the game too.", true},
-    {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff,
-     "Swaps up and down for the mouse: moving it forward tilts the camera down.", true},
+     "How far the camera turns for a mouse movement, with either Mouse camera: at 1.00 native look turns 0.1 degree a "
+     "count. The - and = keys change it in game too.", nullptr, false, true},
+    {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff, "Swaps up and down for the mouse.",
+     hn_mouse_invert, false, true},
     {TAB_CONTROLS, "Invert camera X", &opts.invert_cam_x, 0, 1, 1, tx_onoff,
-     "Inverts horizontal look (left/right) on the right analog stick.", true},
+     "Inverts horizontal look (left/right) on the right analog stick.", nullptr, false, true},
     {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
-     "Inverts vertical look (up/down) on the right analog stick.", true},
+     "Inverts vertical look (up/down) on the right analog stick.", nullptr, false, true},
     {TAB_CONTROLS, "Rumble strength", &opts.rumble, 0, 150, 25, tx_rumble,
-     "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", true},
+     "How strongly the controller rumbles, in percent of the game's rumble. Off turns it off.", nullptr, false, true},
     {TAB_CONTROLS, "Motion controls", &opts.gyro, 0, 1, 1, tx_gyro,
-     "Aims and looks with the controller's gyroscope where the game uses motion, as on the Switch. Works with Switch Pro "
-     "controllers and pads in Switch mode, DualSense and DualShock 4. Shown beside it: whether the connected pad has one."},
+     "Aiming and looking with the controller's gyroscope where the game uses motion, as on the Switch.", hn_gyro},
     {TAB_CONTROLS, "Motion sensitivity X", &opts.gyro_sens_x, 10, 300, 10, tx_percent,
-     "How far the aim moves left and right for a given turn of the controller. 100% is the console's own.", true},
+     "How far the aim moves left and right for a given turn of the controller. 100% is the console's own.", nullptr, false,
+     true},
     {TAB_CONTROLS, "Motion sensitivity Y", &opts.gyro_sens_y, 10, 300, 10, tx_percent,
-     "How far the aim moves up and down for a given tilt of the controller. 100% is the console's own.", true},
-    {TAB_CONTROLS, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff,
-     "Turns the motion aim's left and right around.", true},
-    {TAB_CONTROLS, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff,
-     "Turns the motion aim's up and down around.", true},
+     "How far the aim moves up and down for a given tilt of the controller. 100% is the console's own.", nullptr, false,
+     true},
+    {TAB_CONTROLS, "Invert motion X", &opts.gyro_inv_x, 0, 1, 1, tx_onoff, "Turns the motion aim's left and right around.",
+     nullptr, false, true},
+    {TAB_CONTROLS, "Invert motion Y", &opts.gyro_inv_y, 0, 1, 1, tx_onoff, "Turns the motion aim's up and down around.",
+     nullptr, false, true},
     {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
-     "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
+     "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
     {TAB_GAMEPLAY, "Cheats", nullptr, 0, 0, 0, nullptr,
@@ -396,9 +614,67 @@ constexpr int kMenuWidth = menu_hit::kWidth;   // (at a scale of 1: 720 lines)
 int cur_tab = TAB_GRAPHICS;
 int tab_selected[TAB_COUNT] = {0, 0, 0};
 
+// ---- the rows that take a restart: their values at the start (menu_init, the GPU's at menu_set_gpu_count) ----
+namespace mr = menu_restart;
+mr::State restart_state;
+int restart_slot[kRows];             // (a row's slot in restart_state, -1 none)
+const char* restart_names[mr::kMax];
+void restart_init() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    for (int i = 0; i < kRows; i++) {
+        restart_slot[i] = rows[i].restart && rows[i].value ? restart_state.add(*rows[i].value) : -1;
+        if (restart_slot[i] >= 0) restart_names[restart_slot[i]] = rows[i].name;
+    }
+}
+int restart_slot_of(const Row& r) { return restart_slot[&r - rows]; }
+void restart_values(int* now) {
+    for (int i = 0; i < kRows; i++)
+        if (restart_slot[i] >= 0) now[restart_slot[i]] = *rows[i].value;
+}
+/// The rows whose value is not the one the game runs with (a bit a slot)
+unsigned restart_pending() {
+    int now[mr::kMax];
+    restart_values(now);
+    return restart_state.pending(now);
+}
+/// Whether closing the menu now asks to restart: something pending, not declined with Later, and a window to close
+bool restart_ask() {
+    int now[mr::kMax];
+    restart_values(now);
+    return app_window() && restart_state.ask(now);
+}
+std::string restart_list(const char* last) {
+    return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
+}
+int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
+/// "Restart needed: " and the pending rows, on one line of width: the last ones as "and N more" when they do not fit
+std::string restart_line(HDC dc, int width) {
+    const unsigned all = restart_pending();
+    std::string line;
+    for (int keep = restart_state.n; keep >= 0; keep--) {   // (the first `keep` pending rows by name)
+        unsigned shown = 0;
+        int named = 0, more = 0;
+        for (int i = 0; i < restart_state.n; i++)
+            if ((all >> i) & 1) (named < keep ? (shown |= 1u << i, named++) : more++);
+        line = "Restart needed: " + mr::names(restart_names, restart_state.n, shown);
+        if (more) line += (named ? " and " : "") + std::to_string(more) + (named ? " more" : more > 1 ? " settings" : " setting");
+        SIZE sz{};
+        GetTextExtentPoint32A(dc, line.c_str(), (int)line.size(), &sz);
+        if (sz.cx <= width) break;
+    }
+    return line;
+}
+
+/// A row on its tab: the Cheats one only with cheats on, the Upscaler only in a build with DLSS
+bool row_shown(int i) {
+    return (i != kCheatsRow || cheats_enabled) && (rows[i].value != &opts.dlss || ur::upscaler_shown(dlss_built())) &&
+           (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built()));
+}
 int tab_row_count(int t) {
     int c = 0;
-    for (int i = 0; i < kRows; i++) if (rows[i].tab == (MenuTab)t && (i != kCheatsRow || cheats_enabled)) c++;
+    for (int i = 0; i < kRows; i++) if (rows[i].tab == (MenuTab)t && row_shown(i)) c++;
     return c;
 }
 /// The most rows a tab has: the menu keeps that height whichever tab is shown
@@ -411,7 +687,7 @@ int max_tab_rows() {
 int tab_row_to_global(int t, int local_idx) {
     int count = 0;
     for (int i = 0; i < kRows; i++) {
-        if (rows[i].tab == (MenuTab)t && (i != kCheatsRow || cheats_enabled)) {
+        if (rows[i].tab == (MenuTab)t && row_shown(i)) {
             if (count == local_idx) return i;
             count++;
         }
@@ -450,6 +726,10 @@ std::string ini_path() {
 }
 const char* ini_key(const Row& r) {
     if (r.value == &opts.output_res) return "output_res";   // (host/nn_applet.c reads it at the start)
+    // (rows renamed since their values were first saved keep their keys: an options file from before still loads)
+    if (r.value == &opts.resolution) return "resolution";
+    if (r.value == &opts.upscale) return "upscaling";
+    if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
     static char k[32];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
@@ -569,7 +849,12 @@ void save() {
 /// A row's new value v, as the arrows set it (dir: 1 up, -1 down, for the rows that skip or wrap), saved unless !keep
 /// (a slider's drag: saved once it is let go)
 void set_row(Row& r, int v, int dir, bool keep = true) {
-    if (r.value == &opts.output_res) {
+    // (nothing else to choose: no change, no save. A saved choice that cannot run here is kept)
+    if (row_fixed(r.value)) return;
+    // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own steps)
+    if (r.value == &opts.dlss) v = ur::step_upscaler(upscaler(), dir, true);
+    if (r.value == &opts.resolution) v = ur::step(upscaler(), *r.value, dir);
+    if (r.value == &opts.output_res) {   // (smallest to largest: kOutputOrder)
         v = step_output_choice(*r.value, dir);
         if (v == *r.value) return;
     }
@@ -585,12 +870,19 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         apply_preset(*r.value);
     } else {
         *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+        // (another Upscaler: the Render resolution moves to the nearest of its steps, DLSS's modes or the game's)
+        if (r.value == &opts.dlss) opts.resolution = ur::snap(upscaler(), opts.resolution);
         if (!r.preset_exempt) {   // (the controls, the window and the counter are not the preset's)
             opts.preset = 0; // Custom
             sync_preset_budgets(0);
         }
     }
     if (r.value == &opts.mic && can_mic()) mic_chosen();   // (hookshot)
+    {   // (a row that takes a restart, or a preset that sets one: asked again at the next close)
+        int now[mr::kMax];
+        restart_values(now);
+        restart_state.note(now);
+    }
     if (keep) save();
 }
 
@@ -679,7 +971,7 @@ const std::vector<int>& bindable_keys() {
     }
     return k;
 }
-int page = 0;          // 0 the options, 1 the controls, 2 the cheats, 3 the teleport list
+int page = 0;          // 0 the options, 1 the controls, 2 the cheats, 3 the teleport list, 4 the inventory, 5 the restart question
 int csel = 0, ccol = 0;   // the controls' row (kControls: reset) and column (0 the gamepad, 1 the keyboard)
 int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
 bool listen_armed = false;   // (once what started it was let go)
@@ -774,6 +1066,7 @@ HFONT font(int px, int weight) {
                        DEFAULT_PITCH, "Segoe UI");
 }
 int help_px = 0;   // (the help text's height: measure_help)
+constexpr int kHintGap = 4, kHintIndent = 10;   // (the value's line: below the row's help, in from its bar)
 /// The help text word-wrapped to width, a TextOutA a line (the POSIX GDI stand-in has no DrawTextA), drawn at (x, y)
 /// when draw: its height in pixels either way
 int wrap_help(HDC dc, const char* text, int width, int x, int y, bool draw) {
@@ -810,7 +1103,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT title = font(20 * s, FW_SEMIBOLD), body = font(16 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, title);
     SetTextColor(dc, RGB(236, 240, 236));
-    const char* heading = page == 4 ? "Inventory" : page == 3 ? "Teleport" : page == 2 ? "Cheats" : "Hookshot";
+    const char* heading = page == 5 ? "Restart needed" : page == 4 ? "Inventory" : page == 3 ? "Teleport"
+                        : page == 2 ? "Cheats" : "Hookshot";
     TextOutA(dc, 16 * s, 12 * s, heading, (int)strlen(heading));
     {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
         // line would run into the title)
@@ -832,6 +1126,38 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         DeleteObject(small);
     }
     SelectObject(dc, body);
+    if (page == 5) {   // (hookshot) the restart question, as the menu closes with a setting that takes a restart
+        SetTextColor(dc, RGB(236, 240, 236));
+        const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
+        const int asked = wrap_help(dc, ask.c_str(), (int)w - 32 * s, 16 * s, 46 * s, true);   // (one line or two)
+        HFONT small = font(14 * s, FW_NORMAL);
+        SelectObject(dc, small);
+        SetTextColor(dc, RGB(176, 186, 180));
+        const char* lost = "Progress since your last save is lost.";
+        TextOutA(dc, 16 * s, std::min(46 * s + asked + 4 * s, 94 * s), lost, (int)strlen(lost));
+        SelectObject(dc, body);
+        const char* const labels[2] = {"Later", "Restart now"};
+        for (int i = 0; i < 2; i++) {
+            const int x = menu_hit::ask_button_x(i, s), y = menu_hit::kAskButtonY * s;
+            const int bw = menu_hit::kAskButtonW * s, bh = menu_hit::kAskButtonH * s;
+            const bool sel = i == ask_sel;
+            if (sel) startup_gdi::round_rect(dc, x - s, y - s, bw + 2 * s, bh + 2 * s, 7 * s, RGB(104, 186, 124));   // (a green edge)
+            startup_gdi::round_rect(dc, x, y, bw, bh, 6 * s, sel ? RGB(44, 72, 54) : RGB(30, 40, 34));
+            SIZE sz{};
+            GetTextExtentPoint32A(dc, labels[i], (int)strlen(labels[i]), &sz);
+            SetTextColor(dc, sel ? RGB(255, 255, 255) : RGB(196, 204, 198));
+            TextOutA(dc, x + (bw - (int)sz.cx) / 2, y + (bh - (int)sz.cy) / 2, labels[i], (int)strlen(labels[i]));
+        }
+        SelectObject(dc, small);
+        SetTextColor(dc, RGB(140, 150, 144));
+        const char* hint = "Left/Right choose   Enter confirms   Esc: Later";
+        TextOutA(dc, 16 * s, 168 * s, hint, (int)strlen(hint));
+        SelectObject(dc, old);
+        DeleteObject(small);
+        DeleteObject(title);
+        DeleteObject(body);
+        return;
+    }
     if (page == 1) {   // (hookshot) the Controls page
         TextOutA(dc, 16 * s + 110 * s, 12 * s + 4 * s, "Controls", 8);
         const int rh = menu_hit::kCtlRowH * s, top = menu_hit::kCtlTop * s, xpad = menu_hit::kCtlPad * s,
@@ -1031,8 +1357,9 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         SIZE nsz{};
         GetTextExtentPoint32A(dc, r.name, (int)strlen(r.name), &nsz);
         const int room = (int)w - 18 * s - (18 * s + (int)nsz.cx + 12 * s);
-        const std::string label = r.value ? r.text(*r.value) : ">";   // (">": a page)
-        const bool arrows = r.value && sel;
+        std::string label = r.value ? r.text(*r.value) : ">";   // (">": a page)
+        if (r.value && r.restart && *r.value != restart_state.start[restart_slot_of(r)]) label += " (after restart)";
+        const bool arrows = r.value && sel && !row_fixed(r.value);
         auto width = [&](const std::string& t) {
             SIZE z{};
             GetTextExtentPoint32A(dc, t.c_str(), (int)t.size(), &z);
@@ -1082,11 +1409,26 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT help = font(14 * s, FW_NORMAL);
     SelectObject(dc, help);
     SetTextColor(dc, RGB(176, 186, 180));
-    wrap_help(dc, rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
+    {   // (what the row is, then on a line of its own, set off by a bar, what its value does: measure_help keeps the room)
+        const Row& r = rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])];
+        const int about = wrap_help(dc, r.help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
+        if (const char* hint = r.value && r.hint ? r.hint(*r.value, -1) : nullptr) {
+            const int y = help_top + 4 * s + about + kHintGap * s;
+            SetTextColor(dc, RGB(150, 166, 156));
+            const int tall = wrap_help(dc, hint, (int)w - (32 + kHintIndent) * s, (16 + kHintIndent) * s, y, true);
+            fill(dc, 16 * s, y + 2 * s, 2 * s, tall - 4 * s, RGB(96, 176, 112));
+        }
+    }
     SelectObject(dc, body);
     SetTextColor(dc, RGB(140, 150, 144));
     const char* hint = "Arrows change   Q/E or LB/RB: tabs   Insert, F1 or Home closes";   // (fits 448 px at 16 px)
     TextOutA(dc, 16 * s, help_top + 4 * s + help_px + 10 * s, hint, (int)strlen(hint));
+    if (cur_tab == TAB_GRAPHICS && restart_pending()) {   // (the rows that take a restart, changed: measure_pending's room)
+        SelectObject(dc, help);
+        SetTextColor(dc, RGB(235, 205, 95));
+        const std::string line = restart_line(dc, (int)w - 32 * s);
+        TextOutA(dc, 16 * s, help_top + 4 * s + help_px + 34 * s, line.c_str(), (int)line.size());
+    }
     SelectObject(dc, old);
     DeleteObject(title);
     DeleteObject(body);
@@ -1127,19 +1469,43 @@ void paint_fps(HDC dc, uint32_t w, uint32_t h, int s) {
     DeleteObject(label);
     DeleteObject(big);
 }
-/// The tallest help text at scale s, in pixels: the menu keeps that height whichever row is selected
+/// The tallest help text at scale s, a row's help and its value's line, in pixels: the menu keeps that height whichever
+/// row is selected and whatever its value
 int measure_help(int s) {
     HDC dc = CreateCompatibleDC(nullptr);
     HFONT f = font(14 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, f);
     int most = 0;
-    for (const Row& r : rows) most = std::max(most, wrap_help(dc, r.help, (kMenuWidth - 32) * s, 0, 0, false));
+    for (const Row& r : rows) {   // (the row's help, and the tallest line any of its values can have)
+        int hint = 0;
+        for (int v = r.lo; r.value && r.hint && v <= r.hi; v++)
+            for (int k = 0; const char* t = r.hint(v, k); k++)
+                hint = std::max(hint, wrap_help(dc, t, (kMenuWidth - 32 - kHintIndent) * s, 0, 0, false));
+        most = std::max(most, wrap_help(dc, r.help, (kMenuWidth - 32) * s, 0, 0, false) + (hint ? kHintGap * s + hint : 0));
+    }
     SelectObject(dc, old);
     DeleteObject(f);
     DeleteDC(dc);
     return most;
 }
+/// The Graphics tab's "Restart needed" line, one line high (the room measure_pending keeps)
+int pending_px = 0;
+int measure_pending(int s) {
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT f = font(14 * s, FW_NORMAL);
+    HGDIOBJ old = SelectObject(dc, f);
+    SIZE sz{};
+    GetTextExtentPoint32A(dc, "Ag", 2, &sz);
+    SelectObject(dc, old);
+    DeleteObject(f);
+    DeleteDC(dc);
+    return (int)sz.cy;
+}
 void redraw_menu(int s) {
+    if (page == 5) {
+        gdi_draw(menu_bmp, kMenuWidth * s, (unsigned)menu_hit::kAskHeight * s, paint_menu, s);
+        return;
+    }
     if (page == 3 || page == 4) {
         gdi_draw(menu_bmp, kMenuWidth * s, (100u + kTeleportLines * (unsigned)menu_hit::kListRowH) * s, paint_menu, s);
         return;
@@ -1153,10 +1519,10 @@ void redraw_menu(int s) {
         return;
     }
     static int measured_at = 0;
-    if (measured_at != s) help_px = measure_help(s), measured_at = s;
-    // (title, the tab strip, the most rows a tab has, the rule and the help text, the hint line)
-    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s), (uint32_t)((44 + 32 + 8 + max_tab_rows() * 28 + 8 + 10 + 30) * s + help_px),
-             paint_menu, s);
+    if (measured_at != s) help_px = measure_help(s), pending_px = measure_pending(s), measured_at = s;
+    // (title, the tab strip, the most rows a tab has, the rule and the help text, the hint line, the restart line)
+    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s),
+             (uint32_t)((44 + 32 + 8 + max_tab_rows() * 28 + 8 + 10 + 30 + 6) * s + help_px + pending_px), paint_menu, s);
 }
 
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
@@ -1288,11 +1654,12 @@ void menu_init() {
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = output_choice(atoi(e));
+    restart_init();   // (what this run started with: the rows that take a restart differ from it once changed)
 }
 
 bool resolution_auto() { return opts.resolution == 0; }
 int resolution_scale() {
-    const float s = opts.resolution > 0 && opts.resolution <= 4 ? kResPercent[opts.resolution] / 100.0f : 0;
+    const float s = upscaler_rows::percent(opts.resolution) / 100.0f;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 
@@ -1303,7 +1670,9 @@ void menu_set_gpu_count(int count) {
             if (opts.gpu_device > count) opts.gpu_device = 0;
         }
     }
-    gpu_device_at_start = opts.gpu_device;
+    restart_init();
+    for (int i = 0; i < kRows; i++)   // (the row's value the game started with, the cards counted)
+        if (rows[i].value == &opts.gpu_device) restart_state.restart_value(restart_slot[i], opts.gpu_device);
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
@@ -1312,6 +1681,10 @@ int menu_player_flight() { return cheats_enabled ? player_flight.load(std::memor
 int menu_free_camera() { return free_camera.load(std::memory_order_relaxed); }
 int menu_take_cheat_action() { return cheat_action.exchange(0, std::memory_order_relaxed); }
 
+void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t window_w, uint32_t window_h) {
+    const auto c = [](uint32_t v) { return (uint64_t)std::min(v, 0xffffu); };
+    present_sizes.store(c(picture_w) << 48 | c(picture_h) << 32 | c(window_w) << 16 | c(window_h), std::memory_order_relaxed);
+}
 void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
@@ -1502,15 +1875,46 @@ void menu_tick() {
         last_x = mx, last_y = my, mouse_read = true;                     // menu as it opens leaves the selection alone)
         if (!mouse) ptr.pressed = 0, ptr.wheel = 0;
     }
-    if (press[0] || press[6]) {
+    // (closing with a setting that takes a restart changed: the restart question first, Later already chosen on it)
+    auto later = [&] {
+        int now[mr::kMax];
+        restart_values(now);
+        restart_state.choose_later(now);
+        open_now = false, page = 0, changed = true;
+    };
+    if ((press[0] || press[6]) && open_now.load() && page == 5) {
+        later();
+    } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
+        page = 5, ask_sel = 0, listening = 0, changed = true;
+    } else if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
         // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
         // layout is not applied over them at start)
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
+        if (open_now.load()) dlss_probe();   // (whether the Upscaler row can offer DLSS here: NGX asked once)
         if (open_now.load()) refresh_mics();   // (the microphones as they are now)
     }
-    if (open_now.load() && page == 1) {   // (hookshot) the Controls page
+    if (open_now.load() && page == 5) {   // (hookshot) the restart question: Later (the default) or Restart now
+        if (mouse) {   // (a button under the cursor chosen, a click on it pressed; the wheel changes it, a right click is Later)
+            const menu_hit::Hit hit = menu_hit::ask(mx, my, scale, mw, mh);
+            if (hit.part == menu_hit::kButton && (moved || ptr.pressed) && hit.index != ask_sel) ask_sel = hit.index, changed = true;
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton) press[7] = true;
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+            if (ptr.wheel) ask_sel ^= 1, changed = true;
+        }
+        if (press[1] || press[2] || press[3] || press[4] || tab_left || tab_right) ask_sel ^= 1, changed = true;
+        if (press[5] || (press[7] && ask_sel == 0)) {
+            later();
+        } else if (press[7]) {   // (Restart now: everything saved, then the window closes as the player would close it)
+            logf("menu: restart now, to apply %s", restart_list(", ").c_str());
+            save();
+            pipeline_cache_save(true);
+            open_now = false, page = 0, changed = true;
+            PostMessageA(app_window(), WM_APP + 9, 0, 0);
+        }
+        if (changed && open_now.load()) redraw_menu(scale);
+    } else if (open_now.load() && page == 1) {   // (hookshot) the Controls page
         if (!can_bind()) page = 0;
         else if (listening) {
             if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
@@ -1763,7 +2167,8 @@ void menu_tick() {
                 }
             }
         }
-        if (press[5]) open_now = false;
+        if (press[5] && restart_ask()) page = 5, ask_sel = 0, changed = true;   // (the restart question first)
+        else if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab)
         if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
         else if (tab_right) cur_tab = (cur_tab + 1) % TAB_COUNT, changed = true;

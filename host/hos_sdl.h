@@ -72,6 +72,12 @@ int16_t hos_sdl_pad_axis(void *pad, int axis);
 const char *hos_sdl_pad_name(void *pad);
 int32_t hos_sdl_pad_id(void *pad);
 void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms);
+/* (HD rumble, host/pad_sdl.c) the pad's SDL_GetGamepadType / SDL_GameControllerGetType, in the loaded SDL's numbers (0
+   unknown, or no such call); whether the SDL has the effect call; a raw effect sent (SDL_SendGamepadEffect /
+   SDL_GameControllerSendEffect): 1 when SDL took it */
+int hos_sdl_pad_type(void *pad);
+int hos_sdl_pad_has_effect(void);
+int hos_sdl_pad_effect(void *pad, const void *data, int size);
 /* motion sensors (SDL_SENSOR_ACCEL m/s^2, SDL_SENSOR_GYRO rad/s, three values each): 0 when the pad or the SDL has none */
 enum { HOS_SDL_SENSOR_ACCEL = 1, HOS_SDL_SENSOR_GYRO = 2 };
 int hos_sdl_pad_has_sensor(void *pad, int type);

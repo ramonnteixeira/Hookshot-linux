@@ -1,0 +1,52 @@
+#version 450
+// (hookshot) NVIDIA DLSS's inputs for OoT's gameplay upscale (vk_dlss.cpp), at the render size, in one pass:
+//  - colour: the network's input as it samples it, the square root of the scene colour (tonemapped, perceptual): DLSS
+//    takes it as LDR colour
+//  - depth: the scene's depth as a plain float image
+//  - motion: where each pixel was in the frame before, in render pixels. The game has no motion vectors: the scene depth
+//    is taken back to clip space and through the frame before's camera (pc.reproject: this frame's clip space to the
+//    frame before's, from the camera's two matrices, its jitter taken off). Only the camera's motion: what moves by itself gets
+//    the motion of what is behind it, until vk_dlss.cpp's actor motion draws the skinned draws' own over it (dlss_actor.vert). pc.flags bit 0: motion (none on the first frame);
+//    bit 1: the motion shown as the colour instead (RX_VK_DLSS_DEBUG=motion); bit 2: only that, from the motion image as it is
+//    then (after vk_dlss.cpp's actor motion drew into it: dlss_actor.vert)
+// The game's clip space: depth from -1 to 1 (NVN's default), y up, the picture's rows top down.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D scene;
+layout(binding = 1) uniform sampler2D scene_depth;
+layout(binding = 2, rgba16f) uniform writeonly image2D color;
+layout(binding = 3, r32f) uniform writeonly image2D depth;
+layout(binding = 4, rg16f) uniform image2D motion;
+layout(push_constant, row_major) uniform P {
+    mat4 reproject;   // (this frame's jittered clip space to the frame before's without its jitter)
+    vec2 jitter;      // (this frame's jitter in clip space: taken off, so the motion has none)
+    ivec2 size;
+    int flags;
+} pc;
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const vec2 size = vec2(pc.size);
+    const vec2 uv = (vec2(g) + 0.5) / size;
+    if ((pc.flags & 4) != 0) {
+        const vec2 m = imageLoad(motion, g).xy;
+        imageStore(color, g, vec4(clamp(abs(m) / 16.0, 0.0, 1.0), textureLod(scene_depth, uv, 0.0).r, 1.0));
+        return;
+    }
+    const vec3 c = textureLod(scene, uv, 0.0).rgb;
+    imageStore(color, g, vec4(clamp(c, 0.0, 1.0), 1.0));
+    const float d = textureLod(scene_depth, uv, 0.0).r;
+    imageStore(depth, g, vec4(d));
+    vec2 mv = vec2(0.0);
+    if ((pc.flags & 1) != 0 && d >= 0.0 && d <= 1.0) {
+        const vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d * 2.0 - 1.0, 1.0);
+        const vec4 before = pc.reproject * clip;
+        if (before.w > 1e-6) {
+            const vec2 then = before.xy / before.w;
+            const vec2 now = clip.xy - pc.jitter;
+            const vec2 px = vec2(then.x - now.x, now.y - then.y) * 0.5 * size;
+            if (all(lessThan(abs(px), vec2(16384.0)))) mv = px;
+        }
+    }
+    imageStore(motion, g, vec4(mv, 0.0, 0.0));
+    if ((pc.flags & 2) != 0) imageStore(color, g, vec4(clamp(abs(mv) / 16.0, 0.0, 1.0), d, 1.0));
+}

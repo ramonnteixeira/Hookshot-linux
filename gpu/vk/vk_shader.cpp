@@ -1297,6 +1297,13 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
         }
         if (!ok) {
             static std::atomic<int> logged{0};
+            // Program owns the stage containers, but their Vulkan handles are not RAII-managed.
+            for (Stage& st : p->stages) {
+                if (st.module) {
+                    vkDestroyShaderModule(dev.device, st.module, nullptr);
+                    st.module = VK_NULL_HANDLE;
+                }
+            }
             if (r.bad && logged++ < 20)
                 logf("vk: program cache: the record of program %016llx at %lld (%zu bytes) is not whole: left out, translated again",
                      (unsigned long long)key, (long long)d.at, d.size);

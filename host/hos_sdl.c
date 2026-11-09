@@ -20,6 +20,7 @@ static struct {
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     /* controllers */
     void *PadOpen, *PadClose, *PadConnected, *PadsUpdate, *PadButton, *PadAxis, *PadName, *PadRumble;
+    void *PadType, *PadEffect;   /* (optional: HD rumble, host/pad_sdl.c) */
     void *PadHasSensor, *PadSensorEnable, *PadSensorData;   /* (motion: optional, NULL in an SDL without them) */
     void *GetGamepads, *GetGamepadID, *Free;   /* (SDL3) */
     void *NumJoysticks, *IsGameController, *DeviceInstanceID, *GetJoystick, *JoystickInstanceID;   /* (SDL2) */
@@ -59,6 +60,9 @@ static int get_all(HMODULE m, int three) {
     GET2(PadAxis, "SDL_GetGamepadAxis", "SDL_GameControllerGetAxis");
     GET2(PadName, "SDL_GetGamepadName", "SDL_GameControllerName");
     GET2(PadRumble, "SDL_RumbleGamepad", "SDL_GameControllerRumble");
+    /* (SDL2 2.0.12 and 2.0.16 on, SDL3 3.2 on: without them every pad keeps the motor rumble) */
+    *(FARPROC *)&f.PadType = GetProcAddress(m, three ? "SDL_GetGamepadType" : "SDL_GameControllerGetType");
+    *(FARPROC *)&f.PadEffect = GetProcAddress(m, three ? "SDL_SendGamepadEffect" : "SDL_GameControllerSendEffect");
     /* (motion sensors: SDL 2.0.14 on and every SDL3; without them the pads still play, with no gyro) */
     *(FARPROC *)&f.PadHasSensor = GetProcAddress(m, three ? "SDL_GamepadHasSensor" : "SDL_GameControllerHasSensor");
     *(FARPROC *)&f.PadSensorEnable = GetProcAddress(m, three ? "SDL_SetGamepadSensorEnabled" : "SDL_GameControllerSetSensorEnabled");
@@ -570,6 +574,13 @@ int32_t hos_sdl_pad_id(void *pad) {
 void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms) {
     if (version == 3) CALL(_Bool (*)(void *, uint16_t, uint16_t, uint32_t), PadRumble)(pad, low, high, ms);
     else CALL(int (*)(void *, uint16_t, uint16_t, uint32_t), PadRumble)(pad, low, high, ms);
+}
+int hos_sdl_pad_type(void *pad) { return f.PadType ? CALL(int (*)(void *), PadType)(pad) : 0; }
+int hos_sdl_pad_has_effect(void) { return f.PadEffect != NULL; }
+int hos_sdl_pad_effect(void *pad, const void *data, int size) {
+    if (!f.PadEffect) return 0;
+    if (version == 3) return CALL(_Bool (*)(void *, const void *, int), PadEffect)(pad, data, size);
+    return CALL(int (*)(void *, const void *, int), PadEffect)(pad, data, size) == 0;
 }
 /* (motion) type: HOS_SDL_SENSOR_ACCEL or _GYRO, the same numbers in both */
 int hos_sdl_pad_has_sensor(void *pad, int type) {

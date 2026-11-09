@@ -167,7 +167,7 @@ with `--update <game folder>`.
 
 | Problem | What to do |
 |---|---|
-| Where is the log? | `hookshot_log.txt` in the game folder holds the last run. The four runs before are `hookshot_log.1.txt` (the last) to `.4.txt`. Started from a terminal, the game prints there instead |
+| Where is the log? | `hookshot_log.txt` in the game folder holds the last run. The four runs before are `hookshot_log.1.txt` (the last) to `.4.txt`. Started from a terminal, the game prints there instead. Every 600 frames it has a `vk: status:` line: the video memory in use of what the driver allows, and DLSS's details while it draws; `vk: over the driver's video-memory allowance` says when the game passed it |
 | "Hookshot supports build e0f3ccfa" or "This version isn't supported" | Check that you chose the right game with its update installed |
 | The game opens and closes, or the log says "device lost" | Update your graphics driver. On AMD cards there are known crashes ([#708](https://github.com/NotRexed/Hookshot/issues/708), [#614](https://github.com/NotRexed/Hookshot/issues/614)) |
 | Parts of the picture are missing, or a message says your card has no mesh shader support | The card or its driver has no mesh shaders. Update the driver; older cards are not supported ([#640](https://github.com/NotRexed/Hookshot/issues/640)) |
@@ -202,8 +202,14 @@ Press <kbd>Insert</kbd> (or <kbd>F1</kbd>) in game, or on a controller the Home 
 The same keys close it, and so does <kbd>Esc</kbd>. The menu has three tabs, Graphics, Gameplay and Controls:
 <kbd>Q</kbd> and <kbd>E</kbd> (or <kbd>Tab</kbd> and <kbd>Shift</kbd>+<kbd>Tab</kbd>) switch between them, LB and RB on
 a controller. <kbd>Up</kbd> and <kbd>Down</kbd> choose a row, <kbd>Left</kbd> and <kbd>Right</kbd> change it
-(<kbd>Enter</kbd> changes it too). On a controller the D-pad chooses and changes, the bottom face button changes too,
-and the right one closes the menu. Your choices are saved in `hookshot_options.ini` in the game folder.
+(<kbd>Enter</kbd> changes it too); under the rows, the help says what the row is and, on a line of its own, what the
+value chosen does. On a controller the D-pad chooses and changes, the bottom face button changes too, and the right
+one closes the menu. Your choices are saved in `hookshot_options.ini` in the game folder.
+
+The rows marked "after a restart" below are read when the game starts. While one is changed, its value says "(after
+restart)" and the foot of the Graphics tab lists it; closing the menu then asks whether to restart now. **Later** keeps
+the change for the next start (and is not asked again until you change one of those rows); **Restart now** saves your
+choices and starts the game again, so progress since your last save is lost.
 
 | Tab | Option | Choices | Default |
 |---|---|---|---|
@@ -212,9 +218,12 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
 | | Frame generation | Off, 2x to 8x | Off |
 | | Frame pacing | Off, On | Off |
-| | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size) | Auto |
+| | NVIDIA Reflex | Off, On, On + Boost (NVIDIA GPUs with `VK_NV_low_latency2`) | Off |
 | | Output resolution | 1920x1080, 2048x1152, 2560x1440, 3840x2160 (after a restart) | 2048x1152 |
-| | Upscaling | Off, Catmull-Rom, Lanczos | Off |
+| | Upscaler | Game's own, NVIDIA DLSS, NVIDIA DLAA (only in builds with NVIDIA's DLSS SDK, below; DLSS and DLAA on RTX GPUs) | Game's own |
+| | DLSS model | Transformer (K), Transformer 2 (M), Transformer 2 (L), NVIDIA default (builds with DLSS; used by DLSS and DLAA) | Transformer (K) |
+| | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLAA: Native | Auto |
+| | Window scaling filter | Off, Catmull-Rom, Lanczos | Off |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Handheld profile | Off, On (after a restart) | Off |
 | | Ultrawide | 16:9, Monitor's shape (after a restart) | 16:9 |
@@ -238,21 +247,33 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | | Layout preset | Nintendo (Def), Xbox / PC, Swap Face, Custom | Nintendo (Def) |
 | | Controls | Opens the Controls page | |
 
-- **Quality preset** sets Resolution, Upscaling, Sharpness, Frame generation, Frame pacing, Game speed, Handheld
-  profile and the video memory limits for a card with that much memory. Changing most other rows yourself sets it back
-  to Custom.
+- **Quality preset** sets Render resolution, Window scaling filter, Sharpness, Frame generation, Frame pacing, Game
+  speed, Handheld profile and the video memory limits for a card with that much memory. It leaves the Upscaler as you
+  chose it: with DLSS, the preset's resolution becomes DLSS's nearest mode. Changing most other rows yourself sets it
+  back to Custom.
 - **GPU device** matters on a PC with more than one graphics card (a laptop's integrated and dedicated GPUs, or a
   second card for Lossless Scaling). Auto prefers a dedicated one, and only cards with Vulkan 1.3 are listed.
   `hookshot_log.txt` lists every card as `vk: device <n>`; `RX_VK_DEVICE=<n>` chooses one for a single run and wins
   over the menu.
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
   show artifacts. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
-- **Output resolution** is the size of the game's whole frame, HUD included, before it is scaled to your window.
-  On a 1920x1080 display, the 1920x1080 option keeps HUD and text sharp when the game fills the screen by mapping them
-  pixel for pixel. The separate **Resolution** setting scales the 3D scene as a share of the output size. Docked only.
-  At 3840x2160 the game's render targets get a bigger GPU pool so full-size 3D fits. For one run, set `HOS_OUTPUT_RES`
+- **The scaling rows**, in the picture's order: **Output resolution** is the size of the game's whole frame, HUD
+  included. The **Upscaler** fills it from the 3D: the game's own network, or NVIDIA DLSS or DLAA (the 3D at full size,
+  edges smoothed). Both look softer than the game's own: set **Sharpness** to around 80% with them. **DLSS model**
+  chooses their network (below). **Render
+  resolution** is the 3D's share of the output. The **Window scaling filter** then scales the frame to your window,
+  and **Sharpness** sharpens it, by the picture's pixels: when the window is much larger than the picture (the Handheld
+  profile's 1536x864 on a 4K screen), a Sharpness kept from an older version is stronger than it was, so a lower one may
+  suit.
+- **Output resolution:** its rows below show the sizes for the output you chose. Docked only. On a 1920x1080 display,
+  the 1920x1080 option keeps HUD and text sharp when the game fills the screen by mapping them pixel for pixel. At
+  3840x2160 the game's render targets get a bigger GPU pool, so a full-size 3D fits. For one run, set `HOS_OUTPUT_RES`
   to `3` for 1920x1080, `0` for 2048x1152, `1` for 2560x1440, or `2` for 3840x2160.
-- **Upscaling** and **Sharpness** also work when Frame generation is Off.
+- **Window scaling filter** matters only when your window's size differs from the Output resolution: for the sharpest
+  picture, set the Output resolution to your screen's, and the row shows "Not needed (window = output)". It and
+  **Sharpness** also work when Frame generation is Off.
+- **NVIDIA Reflex** Off is the game as without it. `RX_VK_REFLEX_LOG=1` logs the driver's latency timings every 300
+  frames while it is on.
 - **Handheld profile** runs the game as if the console were undocked: lower resolution, lighter on the GPU.
 - **Robust buffers:** a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; Off
   can be faster on some NVIDIA cards.
@@ -284,6 +305,17 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 Use a controller, or the keyboard and mouse. On the keyboard, <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> move
 and the arrow keys (or <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd>) turn the camera.
 With the default keyboard bindings, press <kbd>E</kbd> to select **New Game** on the title screen.
+
+**Rumble:** a Nintendo Switch Pro Controller or Joy-Con plays the game's HD rumble as the Switch does, each side and
+both frequency bands as the game asks, with SDL3 (the Windows game brings it; on Linux the system's SDL3, where it has
+one). Other controllers, Switch 2 controllers, a pair of Joy-Cons used as one controller, and SDL2's own library get
+the game's rumble on their two motors. The menu's Rumble strength scales it too. `HOS_HD_RUMBLE=0` sends the Switch
+controllers the motor rumble too. On Linux, SDL talks to the Switch controller itself through its hidraw device, which
+needs read and write access for your user; Steam's udev rules (the `steam-devices` package on most distributions) give
+it. Without them the kernel's hid-nintendo driver runs the controller, and it gets the motor rumble. HD rumble goes to
+anything SDL reports as a Switch Pro Controller or Joy-Con, and that includes third-party controllers in Switch mode
+(8BitDo, GameSir and others; SDL gives them Nintendo's ids). Some of them may turn it into weak rumble or none: set
+`HOS_HD_RUMBLE=0` to give them the plain motor rumble.
 
 To change which gamepad button or key presses a Switch button, or which keys move and turn the camera, open the
 Controls tab's Controls page. Choose a row and a column (Gamepad or Keyboard), press <kbd>Enter</kbd> (or the bottom
@@ -431,6 +463,56 @@ cd ~/Games/Hookshot
 `hookshot_env.txt` and the other test switches are documented below.
 
 <details>
+<summary>NVIDIA DLSS (optional, NVIDIA's SDK under NVIDIA's license)</summary>
+
+A game built with NVIDIA's DLSS SDK offers **NVIDIA DLSS** and **NVIDIA DLAA** in the Graphics tab's **Upscaler** row on
+NVIDIA RTX cards (`dlss=` in `hookshot_options.ini`, `RX_VK_DLSS=0/1/2` for one run): DLSS Super Resolution in place of
+the game's own upscaler, with camera jitter (**NVIDIA Reflex** needs no SDK and is in
+every build). NVIDIA's files are NVIDIA's, under its own license, the
+[NVIDIA RTX SDKs license](https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt).
+Hookshot never includes or redistributes them: each build downloads them for itself, and only after you accept that
+license. Never share a game folder built with them, and do not post builds made with them.
+
+- **Windows, the Hookshot Builder:** tick **NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)** before you
+  build. It is off by default and shows NVIDIA's license when you tick it. The build downloads the SDK into
+  `%LOCALAPPDATA%\HookshotBuilder\ngx-sdk` and puts DLSS's runtime, `nvngx_dlss.dll`, in the game folder's `ngx` folder.
+- **Windows, the command line:** `python -I scripts/ngx_sdk.py --platform windows <sdk folder>` asks you to accept
+  NVIDIA's license (or pass `--accept-nvidia-license`) and fetches the headers, `nvsdk_ngx_s.lib` and `nvngx_dlss.dll`,
+  each checked against its SHA-256. Then build with `HOOKSHOT_NGX_SDK=<sdk folder>`: `make_game.py` copies
+  `nvngx_dlss.dll` into `<game folder>\ngx`. NGX is also pointed at `%LOCALAPPDATA%\Hookshot\ngx`, and at
+  `RX_VK_DLSS_DIR` when it is set, and uses the newest `nvngx_dlss.dll` it finds across them (to try a given one, make
+  sure no other folder has a newer one). Never copy NGX's core, `_nvngx.dll`, beside the game: it comes with NVIDIA's
+  driver.
+- **Linux:** the same with `--platform linux` (or `scripts/linux/ngx-sdk.sh`): `libnvsdk_ngx.a` for the build and
+  `libnvidia-ngx-dlss.so` for the game folder's `ngx` folder (also looked for in `$XDG_DATA_HOME/hookshot/ngx`). NGX's
+  core comes with NVIDIA's Linux driver.
+
+The **DLSS model** row chooses DLSS's network, by NVIDIA's preset letter, for every mode: **Transformer (K)**, the
+transformer model and the one tested most here (the default); **Transformer 2 (M)**, NVIDIA's second-generation
+transformer as it picks it for Performance; **Transformer 2 (L)**, the same generation as tuned for Ultra Performance;
+**NVIDIA default**, which lets DLSS's runtime pick for each mode, so it can change with a runtime update. The runtime
+the SDK comes with (310.9.16) has all of them. A change applies at once, without a restart (`dlss_model=` in
+`hookshot_options.ini`, 0 to 3 in that order). `RX_VK_DLSS_PRESET=<letter>` (or `0` for NVIDIA's default) chooses
+the preset for one run and wins over the row; the log's `vk: NVIDIA DLSS: ... preset <letter>` line says which one was
+asked for, and with `RX_VK_DLSS_LOG=1` NGX's own `Using App hint Preset <letter>` lines say which it took.
+
+**8 GB cards:** DLAA draws the 3D at full size, and DLSS and DLAA add images of their own beside the game's. In busy
+areas that can pass what the driver allows the game, and the game then stutters: Quality or Balanced is safer there.
+The log's `vk: status:` line every 600 frames shows the video memory in use of the allowance, with DLSS's details
+(its images' size, the jitter and the actor motion) appended while it draws, and a `vk: over the driver's
+video-memory allowance` line says when the game passed it.
+
+The game's log says whether DLSS started, and why not when it did not (`vk: NVIDIA DLSS:` lines in `hookshot_log.txt`).
+NGX starts on demand: when the Insert menu first opens (to know whether the Upscaler can offer DLSS) or at the first
+gameplay upscale with DLSS chosen, so on the title screen the log has no NGX lines yet.
+With `RX_VK_DLSS_LOG=1` NGX's own lines go there too (`ngx:`). Some of them look like errors but are not:
+`failed to load NGXCore: 126` (twice) is NVIDIA's library looking for `_nvngx.dll` and `nvngx.dll` beside the game, which
+are not there on purpose, before it loads the driver's; `Feature ... failed to load from cache` is NGX finding no model
+of its own downloads (`C:\ProgramData\NVIDIA\NGX\models`) before it uses the game folder's `nvngx_dlss.dll`.
+
+</details>
+
+<details>
 <summary>Switches for testing (hookshot_env.txt)</summary>
 
 Switches to test (`RX_VK_NOOPT=1` and the others) go in `hookshot_env.txt` in the game folder, one `NAME=VALUE` a
@@ -495,6 +577,8 @@ Hookshot exists thanks to the work of many people:
   after Load (Horizon's mutex handoff) and the exposure flicker fix.
 - **[zortos293/Lichii](https://github.com/zortos293/Lichii)**: reference for Ampere shader lowering, and its compare-exchange retry fix.
 - **[mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw)**: the bundled Windows compiler (no Visual Studio needed).
+- **NVIDIA DLSS**: builds made with NVIDIA's DLSS SDK (optional, downloaded by each build, never bundled) use NVIDIA DLSS
+  Super Resolution, NVIDIA's technology. NVIDIA and DLSS are trademarks of NVIDIA Corporation.
 - **[kinnay/zbic](https://github.com/kinnay/zbic)**, **Opus** and **SDL**: decompression, audio and controllers.
 - **[sostenesfreitas/ocarina-recomp](https://github.com/sostenesfreitas/ocarina-recomp)**: this README's layout, and its notes
   confirmed the mesh stage's control section.

@@ -26,22 +26,27 @@ OS = "windows" if WINDOWS else "linux"
 # Arguments some tests need. {name} is a tool or folder found below (find_tools); a check whose tools are missing is
 # skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
 ARGS = {
+    "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
     "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_prof_sampling.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
     "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
+    "tests/test_vulkan_clear_mip.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_input_background.py": ["--cc", "gcc"],
+    "tests/test_oot_wide_save_picture.py": ["--cc", "gcc"],
     "nx2/test_import_windows.py": ["--cxx", "g++"],
     "tests/test_lower_depbar.py": ["--cxx", "clang++"],
     "tests/test_lower_register_markers.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_audio_in.py": ["--cc", "gcc", "--cxx", "g++"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
+    "tests/test_fg_scale_sharpen.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
     "tests/test_menu_hit.py": ["--cxx", "g++"],
+    "tests/test_menu_restart.py": ["--cxx", "g++", "--cc", "gcc"],
     "tests/test_output_resolution.py": ["--cxx", "{cxx}"],
     "tests/test_nvn_buffer_map.py": ["--cc", "gcc"],
     "tests/test_startup_progress.py": ["--cxx", "g++"],
@@ -62,6 +67,7 @@ ARGS = {
     "nx2/test_timeline_modes.py": ["--cxx", "g++"],
     "tests/test_keep_rendered.py": ["--cxx", "g++"],
     "tests/test_program_answer_domains.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
+    "nx2/test_texture_phi_dominance.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_bc_storage_views.py": ["--headers", "{vulkan_headers}"],
     "nx2/test_mesh_first_types.py": ["--headers", "{spirv_headers}"],
     "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
@@ -98,7 +104,7 @@ SKIP = {
     "tests/test_linux_driver_fault_guard.py": ({"windows"}, "POSIX signals: the Linux guard"),
 }
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
-for _name in ("nx2/test_unsigned_image_types.py", "nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
+for _name in ("nx2/test_texture_phi_dominance.py", "nx2/test_unsigned_image_types.py", "nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
               "nx2/test_spirv_struct_identity.py"):
     SKIP[_name] = ({"windows"}, "needs spirv-val: checked on Linux")
 

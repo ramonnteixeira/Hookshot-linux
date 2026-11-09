@@ -233,6 +233,9 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 /// Device-local memory this process uses and what the driver allows it now (VK_EXT_memory_budget), summed over the
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);
+/// vram_usage asked of the driver now (VMA asks again for a new frame index), for the status line; false when the driver
+/// gives no budget (VK_EXT_memory_budget): used is then the game's own allocations
+bool vram_usage_now(uint64_t* used, uint64_t* budget);
 void vma_log_heaps();
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 

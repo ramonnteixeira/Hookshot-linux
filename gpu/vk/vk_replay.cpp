@@ -11,6 +11,7 @@
 // Without a window (HOS_HEADLESS) presents render into an image of their own; RX_VK_SHOTS=<dir> writes every
 // RX_VK_SHOT_EVERY-th one (default 300) there as a PNG.
 #include <algorithm>
+#include <sys/stat.h>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -25,6 +26,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "vk_dlss.h"
+#include "status_line.h"
+#include "vk_reflex.h"
 #include "vk_draw.h"
 #include "vk_dump.h"
 #include "vk_gprof.h"
@@ -2534,8 +2538,49 @@ void log_frame_stats() {
     }
 }
 
+/// (hookshot) Once a game frame: every 600 a status line (the video memory, DLSS's details while it draws), and every 60
+/// a look at the driver's allowance, warned of once when the use passes it (again only after it was back under)
+void status_tick() {
+    namespace sl = status_line;
+    static uint64_t frames = 0;
+    // (the slowest frame since the last line, present to present: a stall shows here, to be matched with what the log says
+    // around it, such as DLSS's feature made again)
+    static int64_t last_ns = 0, slowest_ns = 0;
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (last_ns) slowest_ns = std::max(slowest_ns, now_ns - last_ns);
+    last_ns = now_ns;
+    if (++frames % sl::kCheckEvery) return;
+    uint64_t used = 0, allowed = 0;
+    const bool known = vram_usage_now(&used, &allowed);
+    static bool told_unknown = false;
+    if (!known && !told_unknown) {
+        told_unknown = true;
+        logf("vk: status: the driver gives no video-memory budget (VK_EXT_memory_budget): only the game's own allocations are known");
+    }
+    char dlss[320] = "";
+    const bool line = frames % sl::kEvery == 0;
+    const int mode = line ? dlss_status(dlss, sizeof dlss) : dlss_mode();   // (dlss_status: since the last line, so only for one)
+    static bool over = false;
+    if (known && sl::crossed(over, used, allowed)) {
+        char w[200];
+        sl::over_text(w, sizeof w, used, allowed, mode);
+        logf("%s", w);
+    }
+    if (!line) return;
+    char v[128];
+    sl::vram_text(v, sizeof v, used, allowed, known);
+    logf("vk: status: %d frames, the slowest %.1f ms; %s%s", sl::kEvery, slowest_ns / 1e6, v, dlss);
+    slowest_ns = 0;
+}
+
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 void do_present(const nvn_tex* t, const int crop[4]) {
+    // (hookshot) NVIDIA Reflex (vk_reflex.cpp): this frame's simulation ended, its submission starts; on the way out (after the
+    // present) the driver's sleep until the next frame should begin
+    dlss_idle();   // (NVIDIA DLSS: its video memory let go once it has not been used for a while)
+    status_tick();   // (the status line, and the video-memory warning)
+    reflex_present_begins();
+    struct ReflexSleep { ~ReflexSleep() { reflex_sleep(); } } reflex_sleep_after;
     {   // (hookshot, RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
         static std::atomic<int64_t> seen{0};
         static const int64_t at = getenv("RX_VK_PASS_TRACE_AT") ? atoll(getenv("RX_VK_PASS_TRACE_AT")) : 0;
@@ -2614,6 +2659,12 @@ void do_present(const nvn_tex* t, const int crop[4]) {
             static const int64_t shot_from = getenv("RX_VK_SHOT_FROM") ? atoll(getenv("RX_VK_SHOT_FROM")) : -1;
             static const int64_t shot_to = getenv("RX_VK_SHOT_TO") ? atoll(getenv("RX_VK_SHOT_TO")) : -1;
             shot = shots && (presents % shot_every == 0 || (presents >= shot_from && presents <= shot_to));
+            // (RX_VK_SHOT_GO=<file>: every present while that file is there too, a test's run of frames)
+            static const char* shot_go = getenv("RX_VK_SHOT_GO");
+            if (shots && shot_go && !shot) {
+                struct stat sb;
+                shot = stat(shot_go, &sb) == 0;
+            }
             // (RX_VK_SHOT_MADE=1: the frame interpolation made before it too, written beside it as vk_N_made.png)
             static const bool shot_made = getenv("RX_VK_SHOT_MADE") != nullptr;
             uint32_t mw = 0, mh = 0;
@@ -3006,6 +3057,16 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     if (const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire)) {   // (the window was resized: main's resize)
         std::lock_guard qk(dev.present_mu);
         create_swapchain((uint32_t)(want >> 32), (uint32_t)want);
+    } else if (reflex_swapchain_stale()) {   // (NVIDIA Reflex turned on or off: its latency mode is the swapchain's)
+        std::lock_guard qk(dev.present_mu);
+        create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
+    }
+    if (src) {   // (the Window scaling filter's row: whether the window is the picture's size. Only the game's frames and the
+                 // made ones: the start-up screen (no src) is drawn at the window's own size, which made the row read "Not
+                 // needed" while the game's output was another size; until the first frame the size is not known: needed)
+        const bool cropped = crop && crop[2] > 0 && crop[3] > 0;
+        menu_note_present_sizes(cropped ? (uint32_t)crop[2] : sw, cropped ? (uint32_t)crop[3] : sh, dev.swap_extent.width,
+                                dev.swap_extent.height);
     }
     menu_tick();
     Frame& f = frames[frame_index];
@@ -3114,8 +3175,10 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         st_flushes0 = st_flushes, st_cbs0 = st_batched_cbs;
         std::memcpy(r0, st_reason, sizeof r0);
     }
+    reflex_submit_ends();
     vkQueueSubmit2(dev.queue, 1, &si, f.done);
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    pi.pNext = reflex_present_id(nullptr);   // (NVIDIA Reflex: the frame's present id, and its present's markers)
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &dev.swap_rendered[index];
     pi.swapchainCount = 1;
@@ -3133,6 +3196,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     } else {
         res = vkQueuePresentKHR(dev.queue, &pi);
     }
+    reflex_presented();
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue ? ", on the presents' own queue" : "");
@@ -3666,13 +3730,15 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_present = present;
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
-    t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp)
+    t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp; DLAA: full scale, vk_dlss.cpp)
         if (id == HOS_OPT_CHEAT_HEARTS) return menu_heart_protection();
         if (id == HOS_OPT_CHEAT_FLIGHT) return menu_player_flight();
         if (id == HOS_OPT_CHEAT_ACTION) return menu_take_cheat_action();
         if (id == HOS_OPT_CHEAT_CAMERA) return menu_free_camera();
-        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() : id == 3 ? resolution_scale() : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
-               id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y : 0;
+        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !dlss_full_scale() : id == 3 ? (dlss_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
+               id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y :
+               id == HOS_OPT_DLSS_JITTER_W || id == HOS_OPT_DLSS_JITTER_H ? (int)dlss_jitter_size(id - HOS_OPT_DLSS_JITTER_W) :
+               id == HOS_OPT_DLSS_JITTER_PHASES ? (int)dlss_jitter_size(2) : 0;
     };
     t.option_set = menu_option_set;
     t.nvn_register_sampler = register_sampler_queued;

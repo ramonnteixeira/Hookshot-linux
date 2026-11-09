@@ -1220,6 +1220,18 @@ static int game_main(int argc, char **argv) {
     }
 #endif
     {   // (started from its icon the game has nowhere to log to: hookshot_log.txt beside it, last run only, for players to send in)
+#ifdef _WIN32
+        {   /* (started again by the Insert menu's Restart now (host/hos_relaunch.c): the run before still has its log open until
+               it exits, so wait for it (up to 10 s) before the log moves to .1, or the move fails and its log is overwritten) */
+            const char *of = getenv("HOS_RESTART_OF");
+            if (of && *of) {
+                HANDLE before = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)strtoul(of, NULL, 10));
+                if (before) WaitForSingleObject(before, 10000), CloseHandle(before);
+                SetEnvironmentVariableA("HOS_RESTART_OF", NULL);   /* (not passed on: a later restart sets its own) */
+                _putenv("HOS_RESTART_OF=");
+            }
+        }
+#endif
         HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
         if (!err || err == INVALID_HANDLE_VALUE || GetFileType(err) == FILE_TYPE_UNKNOWN) {
             char path[MAX_PATH + 32];

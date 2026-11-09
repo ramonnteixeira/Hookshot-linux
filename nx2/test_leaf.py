@@ -311,7 +311,8 @@ def build(tmp, P, roots, funcs, meta, img_size, addr64):
     if addr64:
         rt = rtgen.write(os.path.join(tmp, "rt64"))   # (its a64.h shadows the vendored one)
     src = ['#include "a64.h"'] + ["void f_%08x(Ctx *A64_NOESC);" % e for e in sorted(funcs)]
-    src += [P.emitted[e][0] for e in sorted(funcs)]
+    body = "\n".join(P.emitted[e][0] for e in sorted(funcs))
+    src.append(body if os.environ.get("A64_MARK_EACH") else a64_lift.mark_groups(body))   # (nx2/lift.py's last step)
     src.append(HARNESS % {
         "table": ",".join("f_%08x" % e for _, e, _ in roots),
         "regions": ",".join("{%#xULL,%#xULL}" % r for r in writable_regions(meta)),

@@ -7,6 +7,7 @@
 #include "vk_internal.h"
 #include <vk_mem_alloc.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace mkwvk {
@@ -185,9 +186,15 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
 
 /// The system-memory heaps the GPU reaches: what the process uses there (the imported guest memory too: pinned by the
 /// driver) and what the driver allows it, asked now (a new frame index makes VMA ask the driver again); false when unknown
+namespace {
+std::atomic<uint32_t> budget_frame{0};   // (VMA's frame index: a new one makes it ask the driver for the budgets again)
+}
+bool vram_usage_now(uint64_t* used, uint64_t* budget) {
+    vmaSetCurrentFrameIndex(vma, ++budget_frame);
+    return vram_usage(used, budget) && dev.memory_budget;
+}
 bool system_heap_usage(uint64_t* used, uint64_t* budget) {
-    static uint32_t frame = 0;
-    vmaSetCurrentFrameIndex(vma, ++frame);
+    vmaSetCurrentFrameIndex(vma, ++budget_frame);
     VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
     vmaGetHeapBudgets(vma, b);
     uint64_t u = 0, t = 0;

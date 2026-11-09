@@ -331,7 +331,8 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
         const nvn_view* v = p.has_view ? &p.view : nullptr;
         for (uint32_t k = 0; k < s.layers; k++) {
             nvn_view lv = v ? *v : nvn_view{};
-            lv.set_levels = 1, lv.base_level = (uint8_t)s.level, lv.nlevels = 1;
+            // texture_view takes a guest mip level and subtracts skip itself.
+            lv.set_levels = 1, lv.base_level = (uint8_t)(s.level + s.tex->skip), lv.nlevels = 1;
             lv.set_layers = 1, lv.min_layer = (uint16_t)(s.layer + k), lv.nlayers = 1;
             const VkImageView view = texture_view(s.tex, p.tex, &lv, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment);
             if (!view) continue;

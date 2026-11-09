@@ -16,7 +16,7 @@ static class Program
     }
 
     static ProcessStartInfo Info(Tools tools, string[] args, int? workers = null) =>
-        (ProcessStartInfo)InfoMethod.Invoke(null, new object?[] { tools, args, workers })!;
+        (ProcessStartInfo)InfoMethod.Invoke(null, new object?[] { tools, args, workers, null })!;   // (ngxSdk: none)
 
     static async Task<JsonElement> Delivery(ProcessStartInfo info)
     {

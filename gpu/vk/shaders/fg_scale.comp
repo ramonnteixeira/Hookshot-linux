@@ -1,6 +1,7 @@
 #version 450
 // the frame to the window's size (the Insert menu's Upscaling, Sharpness): Catmull-Rom or Lanczos 2, or the linear filter, then
-// a contrast-limited sharpen that cannot go past the light around the pixel, so it adds no halos and no flashes
+// a contrast-adaptive sharpen in the manner of AMD FidelityFX RCAS that cannot go past the light around the pixel, so it adds no halos,
+// no clipping and no flashes
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, rgba8) uniform writeonly image2D dst;
@@ -36,6 +37,24 @@ vec3 filtered(vec2 uv) {
         }
     return sum / weight;
 }
+// The Sharpness slider (pc.sharp 0 to 1) is RCAS's strength: 0 the picture as filtered, 1 its strongest lobe.
+const float kMaxLobe = 0.25 - 1.0 / 16.0;
+vec3 sharpen(vec3 c, vec3 n, vec3 s, vec3 w, vec3 e, float amount) {
+    // RCAS: the four neighbours weighted by a negative lobe, the largest that keeps the result inside 0..1 for this
+    // neighbourhood (smaller where the light is near black or white), then normalized. Two differences from RCAS's own
+    // maths: the room to black divides by 4 x the lightest of the pixel and its neighbours (RCAS: of the neighbours
+    // alone), never more room than RCAS gives, so only more careful; and like RCAS the room is the smallest of the three
+    // channels, so a saturated colour (a channel near 0 or 1, not only near black or white) is sharpened little
+    const vec3 lo4 = min(min(n, s), min(w, e)), hi4 = max(max(n, s), max(w, e));
+    const vec3 lo = min(lo4, c), hi = max(hi4, c);
+    const vec3 to_black = lo / max(4.0 * hi, vec3(1.0 / 1024.0));
+    const vec3 to_white = (1.0 - hi) / max(4.0 - 4.0 * lo4, vec3(1.0 / 1024.0));
+    const vec3 room = min(to_black, to_white);
+    const float lobe = -clamp(min(min(room.r, room.g), room.b), 0.0, kMaxLobe) * clamp(amount, 0.0, 1.0);
+    const vec3 sharp = (c + lobe * (n + s + w + e)) / (1.0 + 4.0 * lobe);
+    // (and no further than the lightest and darkest pixel around it: an edge gets steeper, no halo beside it)
+    return clamp(sharp, lo, hi);
+}
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     const ivec2 d = imageSize(dst);
@@ -43,11 +62,13 @@ void main() {
     const vec2 uv = (vec2(g) + 0.5) / vec2(d);
     vec3 c = filtered(uv);
     if (pc.sharp > 0.0) {
-        const vec2 e = 1.0 / vec2(d);
+        // The neighbours one picture pixel away (one window pixel when the window is the smaller). They were one window
+        // pixel away, a fraction of a picture pixel when the window is larger (0.53 for 2048 x 1152 on a 3840 x 2160
+        // screen): what the slider did then hung on the window's size, not on the picture.
+        const vec2 e = max(1.0 / vec2(textureSize(src, 0)), 1.0 / vec2(d));
         const vec3 n = textureLod(src, uv + vec2(0.0, -e.y), 0.0).rgb, s = textureLod(src, uv + vec2(0.0, e.y), 0.0).rgb;
         const vec3 w = textureLod(src, uv + vec2(-e.x, 0.0), 0.0).rgb, r = textureLod(src, uv + vec2(e.x, 0.0), 0.0).rgb;
-        const vec3 lo = min(min(min(n, s), min(w, r)), c), hi = max(max(max(n, s), max(w, r)), c);
-        c = clamp(c + pc.sharp * (c - (n + s + w + r) * 0.25), lo, hi);
+        c = sharpen(c, n, s, w, r, pc.sharp);
     }
     imageStore(dst, g, vec4(c, 1.0));
 }

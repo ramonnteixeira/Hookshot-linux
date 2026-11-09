@@ -15,6 +15,7 @@ Usage:  python -I nx2/lift.py [--exefs <dir>] [--work <dir>] [--write] [--max-fu
 """
 import argparse
 import collections
+import glob
 import json
 import os
 import struct
@@ -110,6 +111,8 @@ def coverage(L, img, out_dir):
     return total
 
 
+
+
 def main():
     kit.wait_for_quiet('the lift')
     p = argparse.ArgumentParser()
@@ -158,6 +161,9 @@ def main():
     if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
         import oot_wide
         oot_wide.install(L, img)
+        import oot_jitter   # (NVIDIA DLSS's camera jitter in a build with it, none unless DLSS runs: host/rx_backend.c)
+        if oot_jitter.wanted():
+            oot_jitter.install(L, img)
         import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
         oot_occlusion.install(L, img)
     L.discover(max_insns=a.max_func)
@@ -180,7 +186,7 @@ def main():
                              counters=[] if a.no_polls else [poll.stats])
         import oot_patches
         main_build = next((m["build_id"] for m in meta["modules"] if m["name"] == "main"), "")
-        oot_patches.apply(gen, protect_hearts=a.standalone and main_build == oot_patches.LIFE_BUILD_ID)
+        chunks.edit_c(gen, L.stats, a.standalone and main_build == oot_patches.LIFE_BUILD_ID, whole=not a.max_func)
         a64_rtgen.write(gen)
         if a.standalone:
             start, exit_ = standalone.write_image_c(gen, img, meta, a.exefs)

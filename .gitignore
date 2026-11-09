@@ -34,3 +34,6 @@ __pycache__/
 # ---- Linux builds ----
 build-linux/
 *.so
+
+# ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
+ngx-sdk/

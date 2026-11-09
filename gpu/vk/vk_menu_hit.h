@@ -19,6 +19,10 @@ constexpr int kCtlWidth = 600, kCtlTop = 64, kCtlRowH = 24, kCtlPad = 200, kCtlK
 constexpr int kCheatTop = 44, kCheatRowH = 28;   // the cheats' rows, from kCheatTop
 constexpr int kListTop = 48, kListRowH = 24;     // a list's lines (a section's heading is one too), from kListTop
 constexpr int kListValueRight = 16;              // a cheat's or a list line's value ends kListValueRight from the right
+// ---- the restart question (closing the menu with a setting that takes a restart): its two buttons, Later and Restart now ----
+constexpr int kAskHeight = 196;                  // the page's height (kWidth wide)
+constexpr int kAskButtonY = 120, kAskButtonH = 34;
+constexpr int kAskButtonX = 16, kAskButtonW = 150, kAskButtonGap = 16;   // Later at kAskButtonX, Restart now after the gap
 
 enum Part {
     kNone,      // off the menu's controls (still over the menu: a click does nothing)
@@ -32,6 +36,7 @@ enum Part {
     kCtlCell,   // a binding: index the row, side 0 the gamepad's, 1 the keyboard's
     kCheatRow,  // the Cheats page: a row (index), side -1 the value's left half, 1 its right half, 0 the name
     kListLine,  // a list (the teleport list, the inventory): a line as shown (index, 0 the top one), side as kCheatRow
+    kButton,    // the restart question's buttons: index 0 Later, 1 Restart now
 };
 struct Hit {
     Part part = kNone;
@@ -147,6 +152,17 @@ inline Hit cheats(int x, int y, int s, int w, int h, int count, const int* value
 /// A list page: count the lines shown (headings included); index is the line from the top as shown, not the item
 inline Hit list_lines(int x, int y, int s, int w, int h, int count, const int* value_l) {
     return row_list(x, y, s, w, h, kListTop, kListRowH, count, value_l, kListLine);
+}
+
+/// The restart question: (x, y) in its pixels, w x h its size, s its scale
+inline int ask_button_x(int i, int s) { return (kAskButtonX + i * (kAskButtonW + kAskButtonGap)) * s; }
+inline Hit ask(int x, int y, int s, int w, int h) {
+    Hit hit;
+    if (x < 0 || y < 0 || x >= w || y >= h) return hit.part = kOutside, hit;
+    if (y < kAskButtonY * s || y >= (kAskButtonY + kAskButtonH) * s) return hit;
+    for (int i = 0; i < 2; i++)
+        if (x >= ask_button_x(i, s) && x < ask_button_x(i, s) + kAskButtonW * s) hit.part = kButton, hit.index = i;
+    return hit;
 }
 
 } // namespace mkwvk::menu_hit

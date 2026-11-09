@@ -101,6 +101,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
           <StackPanel>
             <TextBlock x:Name="FilesTitle" Style="{StaticResource Heading}" Text="Build your game"/>
@@ -172,6 +173,15 @@
               </ComboBox>
             </StackPanel>
           </Grid>
+
+          <!-- NVIDIA DLSS: off unless ticked. Ticking it shows NVIDIA's license; the build downloads NVIDIA's SDK under it
+               (make_game.py, scripts/ngx_sdk.py). Nothing of NVIDIA's comes with the builder -->
+          <StackPanel Grid.Row="5" Margin="0,14,0,0">
+            <CheckBox x:Name="DlssTick" Style="{StaticResource Tick}" IsChecked="False" Click="DlssChanged"
+                      Content="NVIDIA DLSS (downloads NVIDIA's SDK under NVIDIA's license)"/>
+            <TextBlock Style="{StaticResource Note}" FontSize="12" Margin="26,4,0,0" TextWrapping="Wrap"
+                       Text="For NVIDIA RTX graphics cards. NVIDIA's files stay on this PC: never share a game folder built with them."/>
+          </StackPanel>
 
           </Grid>
           </ScrollViewer>

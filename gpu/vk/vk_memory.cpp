@@ -2467,7 +2467,6 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     Pool* p = pool_of(guest, size);
     if (!p) return {};
     tl = {p, pools_gen.load(std::memory_order_relaxed)};
-    (void)par;
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
@@ -2478,9 +2477,12 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // submission, the GPU read it there while the game's threads wrote it for their next frames, and a pass that drew
     // over the moment a write landed came out in two (shadows dark below a line for a frame, the line moving; a new
     // pool every so many frames as the per-frame data moves on). Not when this part already wrote it in guest memory:
-    // the copy at the part's start would miss that. RX_VK_MIRROR_DEFER=1: at the next submission, as before)
+    // the copy at the part's start would miss that. Not in a parallel replay's segment either: its copy goes into the
+    // uploads of the segment whose worker bound the pool first, which need not be the first in the queue. A segment
+    // before it found the mirror in the page table and read it unfilled (houses, rocks and bushes missing, geometry
+    // torn, the more the segments the worse; #994 with RX_VK_PARALLEL). RX_VK_MIRROR_DEFER=1: at the next submission, as before)
     static const bool defer = getenv("RX_VK_MIRROR_DEFER") != nullptr;
-    if (p->mstate == Pool::MIRROR_NONE && !defer && p->direct_write_epoch != mirror_epoch && mirror_make(*p)) {
+    if (p->mstate == Pool::MIRROR_NONE && !defer && !par && p->direct_write_epoch != mirror_epoch && mirror_make(*p)) {
         publish_cap_ranges();
         static int64_t made_now;
         if (++made_now % 200 == 1)
@@ -2890,10 +2892,13 @@ std::deque<DeadShadow> dead_shadows;
 uint64_t shadow_bytes = 0;
 int64_t st_wbd_runs = 0, st_wbd_bytes = 0, st_wbd_fill_pages = 0;
 bool wb_diff_on() {
-    // (hookshot, v2.0.9) OFF by default for now: on an RTX 4090 with NVIDIA's newer driver (0x9b438000, the 621 line) the GPU was lost
-    // in a write-back diff pass within the first few hundred submissions, every start (issue 1161), where v2.0.7 ran; on 0x9a100000 it
-    // was fine and worth ~20% fps. RX_VK_WB_DIFF=1: on
-    static const bool on = getenv("RX_VK_WB_DIFF") && atoi(getenv("RX_VK_WB_DIFF")) != 0;
+    // (hookshot) On by default again (v2.0.11). v2.0.9 turned it off with the presents' own queue after the device lost on an RTX 4090
+    // with NVIDIA's 621 driver (issue 1161); the reporter's A/B then put that on the present queue (black screen with it alone), and the
+    // write-back diff alone ran there and on drivers 615 and 621 for others: ~20% fps (an RTX 3080 laptop went 40 -> 25 fps without
+    // it). RX_VK_WB_DIFF=0: off
+    // (integrated GPUs too: an Ally X's hard reboots stopped with v2.0.8 and came back with v2.0.9's off, issue 997: the whole copies
+    // are long submissions there. Its shadows are the system's RAM on them, so at most 512 MB: shadow_room)
+    static const bool on = !getenv("RX_VK_WB_DIFF") || atoi(getenv("RX_VK_WB_DIFF")) != 0;
     return on;
 }
 void shadow_free(Pool& p) {   // (pools_mu held: destroyed once the submissions so far are done)
@@ -2913,7 +2918,9 @@ bool shadow_room(uint64_t n) {   // (the shadows' budget, and VRAM 85% full at m
     static const uint64_t cap = [] {
         if (const char* e = getenv("RX_VK_WB_SHADOW_MB")) return (uint64_t)atoll(e) << 20;
         uint64_t used = 0, allowed = 0;
-        return vram_usage(&used, &allowed) && allowed ? allowed / 8 : (uint64_t)512 << 20;   // (uint64_t: unsigned long on Linux)
+        const uint64_t eighth = vram_usage(&used, &allowed) && allowed ? allowed / 8 : (uint64_t)512 << 20;   // (unsigned long on Linux)
+        // (an integrated GPU's VRAM is the system's RAM: 512 MB at most there)
+        return dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? std::min<uint64_t>(eighth, (uint64_t)512 << 20) : eighth;
     }();
     if (shadow_bytes + n > cap) return false;
     uint64_t used = 0, allowed = 0;
